@@ -1,0 +1,39 @@
+[package]
+name = "tej-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Modular, high-performance embedded ACID DBMS in pure Rust with native vector and HTAP engines"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "embedded", "acid", "vector", "htap"]
+categories = ["database-implementations", "embedded-database"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+tej-db-btree.workspace = true
+tej-db-txn.workspace = true
+tej-db-vector.workspace = true
+tej-db-vectorized.workspace = true
+roaring.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+bincode.workspace = true
+
+[features]
+default = ["mmap", "compression", "encryption"]
+mmap = ["tej-db-pager/mmap"]
+compression = ["tej-db-pager/compression"]
+encryption = ["tej-db-pager/encryption"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

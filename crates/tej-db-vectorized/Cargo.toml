@@ -1,0 +1,24 @@
+[package]
+name = "tej-db-vectorized"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Morsel-driven parallel query engine with SIMD vector filters, joins, and aggregates for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "vectorized", "htap", "olap", "parallel"]
+categories = ["database-implementations"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-columnar.workspace = true
+roaring.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

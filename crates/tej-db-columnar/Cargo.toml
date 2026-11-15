@@ -1,0 +1,26 @@
+[package]
+name = "tej-db-columnar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hybrid columnar row-groups, SIMD ColumnVector, ZoneMaps, and Parquet/Arrow codecs for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "columnar", "zonemap", "simd", "parquet"]
+categories = ["database-implementations", "compression"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+roaring.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

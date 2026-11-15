@@ -1,0 +1,30 @@
+[package]
+name = "tej-db-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SIMD RaBitQ 1/2-bit quantization, FWHT transforms, and Vamana graph index for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "vector-search", "ann", "rabitq", "vamana"]
+categories = ["database-implementations", "algorithms"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+tej-db-btree.workspace = true
+tej-db-txn.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+parking_lot.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

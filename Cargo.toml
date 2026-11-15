@@ -1,0 +1,125 @@
+[workspace]
+members = [
+    "crates/tej-db-core",
+    "crates/tej-db-pager",
+    "crates/tej-db-btree",
+    "crates/tej-db-txn",
+    "crates/tej-db",
+    "crates/tej-db-sql",
+    "crates/tej-db-vector",
+    "crates/tej-db-columnar",
+    "crates/tej-db-vectorized",
+    "crates/tej-db-cli",
+    "tests",
+    "benches",
+    "examples/axum-api",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+authors = [
+    "Yeabsira Bezabih <yeabsirabezabih791@gmail.com>",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/YeabsiraBezabih/tej-db"
+homepage = "https://github.com/YeabsiraBezabih/tej-db"
+documentation = "https://docs.rs/tej-db"
+readme = "README.md"
+
+[workspace.dependencies]
+tej-db-core = { version = "0.1.0", path = "crates/tej-db-core" }
+tej-db-pager = { version = "0.1.0", path = "crates/tej-db-pager" }
+tej-db-btree = { version = "0.1.0", path = "crates/tej-db-btree" }
+tej-db-txn = { version = "0.1.0", path = "crates/tej-db-txn" }
+tej-db = { version = "0.1.0", path = "crates/tej-db" }
+tej-db-sql = { version = "0.1.0", path = "crates/tej-db-sql" }
+tej-db-vector = { version = "0.1.0", path = "crates/tej-db-vector" }
+tej-db-columnar = { version = "0.1.0", path = "crates/tej-db-columnar" }
+tej-db-vectorized = { version = "0.1.0", path = "crates/tej-db-vectorized" }
+tej-db-cli = { version = "0.1.0", path = "crates/tej-db-cli" }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Checksumming & hashing
+crc32fast = "1.4"
+roaring = { version = "0.10", features = ["serde"] }
+
+# Synchronization & concurrency
+parking_lot = "0.12"
+smallvec = "1.14"
+tokio = { version = "1.43", features = ["full"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# SQL parsing
+sqlparser = "0.54"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Testing & benchmarking
+proptest = "1.6"
+tempfile = "3.17"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# TUI & Terminal
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Optional & Advanced Storage / Compression / Encryption / Serialization
+bincode = "1.3"
+memmap2 = "0.9"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+chacha20poly1305 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "allow"
+fn_params_excessive_bools = "warn"
+string_add = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+module_inception = "allow"
+enum_glob_use = "allow"
+redundant_clone = "warn"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_raw_string_hashes = "allow"
+unreadable_literal = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+manual_let_else = "allow"
+doc_markdown = "allow"

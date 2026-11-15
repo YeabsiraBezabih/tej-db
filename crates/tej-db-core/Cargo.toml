@@ -1,0 +1,29 @@
+[package]
+name = "tej-db-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core primitives, slotted page layouts, bounds, and storage traits for the TejDB embedded DBMS"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "embedded", "acid", "storage", "primitives"]
+categories = ["database-implementations", "embedded-database"]
+
+[features]
+default = ["std"]
+std = [
+    "crc32fast/std",
+    "serde?/std",
+    "thiserror/std",
+]
+
+[dependencies]
+thiserror = { workspace = true, default-features = false }
+crc32fast = { workspace = true, default-features = false }
+serde = { workspace = true, default-features = false, optional = true }
+
+[lints]
+workspace = true

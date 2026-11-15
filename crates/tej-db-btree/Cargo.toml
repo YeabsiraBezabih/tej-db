@@ -1,0 +1,26 @@
+[package]
+name = "tej-db-btree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Copy-On-Write (COW) B+ Tree with zero-copy visitors and in-place staging for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "btree", "cow", "indexing", "zero-copy"]
+categories = ["data-structures", "database-implementations"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

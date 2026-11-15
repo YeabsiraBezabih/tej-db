@@ -1,0 +1,34 @@
+[package]
+name = "tej-db-pager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Storage pager, memory/file/mmap backends, and S3-FIFO buffer cache for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "pager", "buffer-pool", "s3-fifo", "mmap"]
+categories = ["database-implementations", "caching"]
+
+[dependencies]
+tej-db-core.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+memmap2 = { workspace = true, optional = true }
+lz4_flex = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+
+[features]
+default = ["mmap", "compression", "encryption"]
+mmap = ["dep:memmap2"]
+compression = ["dep:lz4_flex"]
+encryption = ["dep:chacha20poly1305"]
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

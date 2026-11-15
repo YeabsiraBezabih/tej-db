@@ -10,7 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 keywords = ["database", "embedded", "acid", "storage", "primitives"]
-categories = ["database-implementations", "embedded-database"]
+categories = ["database-implementations", "data-structures"]
 
 [features]
 default = ["std"]

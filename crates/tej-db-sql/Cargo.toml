@@ -1,0 +1,32 @@
+[package]
+name = "tej-db-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SQLite parity SQL engine, cost-based optimizer (CBO), and BM25 full-text search for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "sql", "sqlite", "cbo", "bm25"]
+categories = ["database-implementations", "parser-implementations"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-txn.workspace = true
+tej-db-vector.workspace = true
+tej-db.workspace = true
+roaring.workspace = true
+sqlparser.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

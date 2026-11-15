@@ -1,0 +1,22 @@
+[package]
+publish = false
+name = "tej-db-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tej-db.workspace = true
+tej-db-sql.workspace = true
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+tej-db-btree.workspace = true
+tej-db-txn.workspace = true
+tej-db-vectorized.workspace = true
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

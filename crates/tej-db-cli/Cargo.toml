@@ -1,0 +1,30 @@
+[package]
+name = "tej-db-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Interactive terminal TUI and CLI administration shell for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "cli", "tui", "shell", "terminal"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+tej-db.workspace = true
+tej-db-sql.workspace = true
+tej-db-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+FROM debian:trixie-slim
+
+WORKDIR /bench
+
+COPY target/release/bench_compare /bench/bench_compare
+COPY target/release/bench_realworld /bench/bench_realworld
+COPY target/release/bench_production /bench/bench_production
+COPY target/release/bench_extreme /bench/bench_extreme
+COPY target/release/bench_writer_matrix /bench/bench_writer_matrix
+COPY target/release/bench_vector /bench/bench_vector
+COPY target/release/bench_htap /bench/bench_htap
+
+COPY docker/duckdb /usr/local/bin/duckdb
+RUN chmod +x /usr/local/bin/duckdb
+
+COPY docker/entrypoint.sh /bench/entrypoint.sh
+RUN chmod +x /bench/entrypoint.sh
+
+ENTRYPOINT ["/bench/entrypoint.sh"]

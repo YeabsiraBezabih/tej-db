@@ -1,0 +1,28 @@
+[package]
+name = "tej-db-txn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Snapshot isolation, lock-free ingestor, OCC conflict validation, and group commit for TejDB"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords = ["database", "transaction", "acid", "occ", "snapshot-isolation"]
+categories = ["database-implementations", "concurrency"]
+
+[dependencies]
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+tej-db-btree.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

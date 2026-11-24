@@ -195,6 +195,15 @@ impl KeyRange {
         }
     }
 
+    /// Empty range that contains no keys.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            start: Bound::Excluded(alloc::vec::Vec::new()),
+            end: Bound::Included(alloc::vec::Vec::new()),
+        }
+    }
+
     #[must_use]
     pub fn contains(&self, key: &[u8]) -> bool {
         let after_start = match &self.start {

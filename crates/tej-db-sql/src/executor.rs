@@ -283,7 +283,11 @@ impl<S: Storage> SqlEngine<S> {
                             }
                             crate::constraint_eval::validate_check_constraints(&schema, &row)?;
                             let updated_val = schema.encode_row_value(&row)?;
-                            let new_key = schema.encode_row_key(&row, 0);
+                            let new_key = if schema.pk_indices.is_empty() {
+                                pk.to_vec()
+                            } else {
+                                schema.encode_row_key(&row, 0)
+                            };
                             if new_key == pk {
                                 tbl.put(pk, &updated_val)?;
                             } else {
@@ -323,7 +327,11 @@ impl<S: Storage> SqlEngine<S> {
 
                         crate::constraint_eval::validate_check_constraints(&schema, &row)?;
                         let updated_val = schema.encode_row_value(&row)?;
-                        let new_key = schema.encode_row_key(&row, 0);
+                        let new_key = if schema.pk_indices.is_empty() {
+                            item.key.clone()
+                        } else {
+                            schema.encode_row_key(&row, 0)
+                        };
                         if new_key == item.key {
                             tbl.put(&item.key, &updated_val)?;
                         } else {

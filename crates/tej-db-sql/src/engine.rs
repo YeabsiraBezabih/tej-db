@@ -40,7 +40,18 @@ impl<S: Storage> fmt::Debug for SqlEngine<S> {
     }
 }
 
+const MAX_PLAN_CACHE_ENTRIES: usize = 1024;
+
 impl<S: Storage> SqlEngine<S> {
+    fn cache_plan(&self, sql: &str, plan: Plan) {
+        let mut cache = self.plan_cache.write();
+        if cache.len() >= MAX_PLAN_CACHE_ENTRIES {
+            if let Some(first) = cache.keys().next().cloned() {
+                cache.remove(&first);
+            }
+        }
+        cache.insert(sql.to_string(), plan);
+    }
     pub fn new(db: &Database<S>) -> Self {
         let initial_rowid = Self::recover_max_rowid(db);
         Self {
@@ -421,7 +432,7 @@ impl<S: Storage> SqlEngine<S> {
             let plan = Planner::plan(stmt, |name| self.get_schema(name).ok().flatten())?;
             last_res = self.execute_plan(plan.clone())?;
             if is_single {
-                self.plan_cache.write().insert(sql.to_string(), plan);
+                self.cache_plan(sql, plan);
             }
         }
 
@@ -444,7 +455,7 @@ impl<S: Storage> SqlEngine<S> {
             let plan = Planner::plan(stmt, |name| self.get_schema(name).ok().flatten())?;
             last_res = self.execute_plan_in_tx(tx, &plan)?;
             if is_single {
-                self.plan_cache.write().insert(sql.to_string(), plan);
+                self.cache_plan(sql, plan);
             }
         }
 

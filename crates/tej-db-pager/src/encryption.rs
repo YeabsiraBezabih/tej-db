@@ -1,6 +1,3 @@
-#[cfg(feature = "encryption")]
-use alloc::format;
-use alloc::vec::Vec;
 use chacha20poly1305::{
     ChaCha20Poly1305, Key, Nonce,
     aead::{Aead, KeyInit, Payload},
@@ -237,12 +234,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             self.inner.allocate_page()?;
         }
 
-        self.write_tag_and_nonce(tag_pid, slot, &nonce, &tag)?;
-        self.inner.write_page(data_pid, cipher_body)
+        // Write data page ciphertext first, followed by tag and nonce metadata
+        self.inner.write_page(data_pid, cipher_body)?;
+        self.write_tag_and_nonce(tag_pid, slot, &nonce, &tag)
     }
 
-    fn sync(&mut self) -> Result<()> {
-        self.flush_tag_cache()?;
+    fn sync(&self) -> Result<()> {
         self.inner.sync()
     }
 

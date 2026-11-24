@@ -35,7 +35,8 @@ impl MmapStorage {
                 "Memory-mapped file length ({file_len} bytes) is not a multiple of PAGE_SIZE ({PAGE_SIZE} bytes)"
             )));
         }
-        if file_len == 0 {
+        let is_new = file_len == 0;
+        if is_new {
             let init = (PAGE_SIZE as u64) * 4;
             file.set_len(init)?;
             file_len = init;
@@ -43,7 +44,20 @@ impl MmapStorage {
 
         // SAFETY: We own the file descriptor exclusively and configure MmapMut over a validated file length.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
-        let page_count = AtomicU64::new(file_len / PAGE_SIZE as u64);
+        let mut actual_pages = 0u64;
+        if !is_new {
+            let total_capacity_pages = file_len / PAGE_SIZE as u64;
+            for p in (0..total_capacity_pages).rev() {
+                let offset = (p as usize) * PAGE_SIZE;
+                if offset + PAGE_SIZE <= mmap.len()
+                    && mmap[offset..offset + PAGE_SIZE].iter().any(|&b| b != 0)
+                {
+                    actual_pages = p + 1;
+                    break;
+                }
+            }
+        }
+        let page_count = AtomicU64::new(actual_pages);
 
         Ok(Self {
             file,
@@ -221,7 +235,7 @@ impl Storage for MmapStorage {
         Ok(PageId(current))
     }
 
-    fn sync(&mut self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         let mmap_guard = self.mmap.read();
         mmap_guard.flush()?;
         Ok(())

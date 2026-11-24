@@ -36,7 +36,7 @@ pub trait Storage: Send + Sync + 'static {
     }
 
     /// Flush all pending writes and sync to physical media (fsync).
-    fn sync(&mut self) -> Result<()>;
+    fn sync(&self) -> Result<()>;
 
     /// Return the total number of allocated pages in storage.
     fn page_count(&self) -> u64;

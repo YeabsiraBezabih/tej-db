@@ -217,82 +217,25 @@ impl FilterExpr {
         let nulls = col.null_bitmap();
         let has_nulls = !nulls.is_empty();
 
+        let eval_pass = |actual: f64| match op {
+            ComparisonOp::Eq => (actual - target).abs() < f64::EPSILON,
+            ComparisonOp::NotEq => (actual - target).abs() >= f64::EPSILON,
+            ComparisonOp::Lt => actual < target,
+            ComparisonOp::Lte => actual <= target,
+            ComparisonOp::Gt => actual > target,
+            ComparisonOp::Gte => actual >= target,
+        };
+
         if let Some(sel) = active_sel {
             for &idx in sel {
-                if (!has_nulls || !col.is_null(idx)) && idx < slice.len() {
-                    let actual = slice[idx];
-                    let pass = match op {
-                        ComparisonOp::Eq => (actual - target).abs() < f64::EPSILON,
-                        ComparisonOp::NotEq => (actual - target).abs() >= f64::EPSILON,
-                        ComparisonOp::Lt => actual < target,
-                        ComparisonOp::Lte => actual <= target,
-                        ComparisonOp::Gt => actual > target,
-                        ComparisonOp::Gte => actual >= target,
-                    };
-                    if pass {
-                        out.push(idx);
-                    }
-                }
-            }
-        } else if !has_nulls {
-            match op {
-                ComparisonOp::Eq => {
-                    for (i, &v) in slice.iter().enumerate() {
-                        if (v - target).abs() < f64::EPSILON {
-                            out.push(i);
-                        }
-                    }
-                }
-                ComparisonOp::NotEq => {
-                    for (i, &v) in slice.iter().enumerate() {
-                        if (v - target).abs() >= f64::EPSILON {
-                            out.push(i);
-                        }
-                    }
-                }
-                ComparisonOp::Lt => {
-                    for (i, &v) in slice.iter().enumerate() {
-                        if v < target {
-                            out.push(i);
-                        }
-                    }
-                }
-                ComparisonOp::Lte => {
-                    for (i, &v) in slice.iter().enumerate() {
-                        if v <= target {
-                            out.push(i);
-                        }
-                    }
-                }
-                ComparisonOp::Gt => {
-                    for (i, &v) in slice.iter().enumerate() {
-                        if v > target {
-                            out.push(i);
-                        }
-                    }
-                }
-                ComparisonOp::Gte => {
-                    for (i, &v) in slice.iter().enumerate() {
-                        if v >= target {
-                            out.push(i);
-                        }
-                    }
+                if (!has_nulls || !col.is_null(idx)) && idx < slice.len() && eval_pass(slice[idx]) {
+                    out.push(idx);
                 }
             }
         } else {
             for (i, &v) in slice.iter().enumerate() {
-                if !col.is_null(i) {
-                    let pass = match op {
-                        ComparisonOp::Eq => (v - target).abs() < f64::EPSILON,
-                        ComparisonOp::NotEq => (v - target).abs() >= f64::EPSILON,
-                        ComparisonOp::Lt => v < target,
-                        ComparisonOp::Lte => v <= target,
-                        ComparisonOp::Gt => v > target,
-                        ComparisonOp::Gte => v >= target,
-                    };
-                    if pass {
-                        out.push(i);
-                    }
+                if (!has_nulls || !col.is_null(i)) && eval_pass(v) {
+                    out.push(i);
                 }
             }
         }
@@ -455,20 +398,27 @@ impl PhysicalOperator for PhysicalFilter {
             }
 
             let mut use_b = true;
+            let mut matched = true;
             for pred in &self.predicates[1..] {
                 if use_b {
                     pred.filter_vector(&chunk, Some(&self.scratch_a), &mut self.scratch_b);
                     if self.scratch_b.is_empty() {
+                        matched = false;
                         break;
                     }
                     use_b = false;
                 } else {
                     pred.filter_vector(&chunk, Some(&self.scratch_b), &mut self.scratch_a);
                     if self.scratch_a.is_empty() {
+                        matched = false;
                         break;
                     }
                     use_b = true;
                 }
+            }
+
+            if !matched {
+                continue;
             }
 
             let final_indices = if use_b {
@@ -476,10 +426,6 @@ impl PhysicalOperator for PhysicalFilter {
             } else {
                 &self.scratch_b
             };
-
-            if final_indices.is_empty() {
-                continue;
-            }
 
             // Zero-copy fast-path: if all rows passed all filters, return chunk directly!
             if final_indices.len() == total_rows {

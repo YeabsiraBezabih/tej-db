@@ -1,7 +1,7 @@
-extern crate alloc;
-
 pub mod cache;
+#[cfg(feature = "compression")]
 pub mod compression;
+#[cfg(feature = "encryption")]
 pub mod encryption;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod file;

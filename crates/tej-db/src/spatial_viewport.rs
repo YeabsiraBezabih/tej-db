@@ -276,8 +276,7 @@ impl<S: Storage> SpatialViewportManager<S> {
         let mut best_dist = f32::INFINITY;
 
         let total_clusters = self.clusters.len();
-        let use_visible =
-            scope == RaycastScope::VisibleOnly && !self.visible_cluster_indices.is_empty();
+        let use_visible = scope == RaycastScope::VisibleOnly;
         let count = if use_visible {
             self.visible_cluster_indices.len()
         } else {

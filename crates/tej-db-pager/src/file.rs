@@ -55,12 +55,6 @@ impl Storage for FileStorage {
         }
 
         let offset = id.0 * PAGE_SIZE as u64;
-        let file_len = self.file.metadata().map_or(0, |m| m.len());
-        if offset + PAGE_SIZE as u64 > file_len {
-            return Err(DbError::Corruption(format!(
-                "Unexpected EOF reading page {id}: offset {offset} + {PAGE_SIZE} exceeds file size {file_len}"
-            )));
-        }
         self.file.read_exact_at(buf, offset)?;
         Ok(())
     }
@@ -83,16 +77,16 @@ impl Storage for FileStorage {
     fn read_overflow_payload(
         &self,
         start_id: PageId,
-        total_len: usize,
+        _total_len: usize,
         out: &mut [u8],
     ) -> Result<bool> {
-        let offset = start_id.0 * PAGE_SIZE as u64;
-        let file_len = self.file.metadata().map_or(0, |m| m.len());
-        if offset + total_len as u64 > file_len {
+        if start_id.0 >= self.page_count {
             return Ok(false);
         }
-
-        self.file.read_exact_at(out, offset)?;
+        let offset = start_id.0 * PAGE_SIZE as u64;
+        if self.file.read_exact_at(out, offset).is_err() {
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -106,18 +100,23 @@ impl Storage for FileStorage {
             static SCRATCH_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
 
-        let offset = start_id.0 * PAGE_SIZE as u64;
-        let file_len = self.file.metadata().map_or(0, |m| m.len());
-        if offset + total_len as u64 > file_len {
+        if start_id.0 >= self.page_count {
             return Ok(None);
         }
+        let offset = start_id.0 * PAGE_SIZE as u64;
 
         SCRATCH_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             if buf.len() < total_len {
                 buf.resize(total_len, 0);
             }
-            self.file.read_exact_at(&mut buf[..total_len], offset)?;
+            if self
+                .file
+                .read_exact_at(&mut buf[..total_len], offset)
+                .is_err()
+            {
+                return Ok(None);
+            }
             let res = f(&buf[..total_len])?;
             Ok(Some(res))
         })
@@ -176,7 +175,7 @@ impl Storage for FileStorage {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         self.file.sync_data()?;
         Ok(())
     }

@@ -1,23 +1,9 @@
 use crate::{BTreeIndex, TxPageSet};
-use tej_db_core::{DbError, Index, KV, KeyRange, Page, Result, Storage};
+use tej_db_core::{DbError, Index, KV, KeyRange, Page, PageId, Result, Storage};
 
-impl<S: Storage> Index for BTreeIndex<S> {
-    /// Zero-copy point lookup. Single-lock traversal directly over in-page slices with zero 4KB copies and zero path allocations.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.with_value(key, |val| Ok(val.to_vec()))
-    }
-
-    /// Copy-On-Write insert with slotted pages and automatic free-list page recycling.
-    fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        let mut tx_pages = TxPageSet::default();
-        let _ = self.insert_in_tx(key, val, &mut tx_pages)?;
-        for pid in tx_pages.retired {
-            self.cache.free_page(pid);
-        }
-        Ok(())
-    }
-
-    fn remove(&mut self, key: &[u8]) -> Result<bool> {
+impl<S: Storage> BTreeIndex<S> {
+    /// Safe transaction-aware key removal honoring CoW and deferring page reclamation into `tx_pages`.
+    pub fn remove_in_tx(&mut self, key: &[u8], tx_pages: &mut TxPageSet) -> Result<bool> {
         let mut path = self.find_leaf_path(key)?;
         let leaf_id = path
             .pop()
@@ -32,11 +18,19 @@ impl<S: Storage> Index for BTreeIndex<S> {
 
         if old_leaf.leaf_is_overflow(del_idx)? {
             let (total_len, old_first) = old_leaf.leaf_get_overflow_ref(del_idx)?;
-            self.free_overflow_extent(old_first, total_len);
+            let num_pages = if total_len == 0 {
+                1
+            } else {
+                total_len.div_ceil(tej_db_core::PAGE_SIZE as u64)
+            };
+            for p in 0..num_pages {
+                tx_pages.retire(PageId(old_first.0 + p));
+            }
         }
 
         let count = old_leaf.item_count();
         let new_leaf_id = self.cache.allocate_page()?;
+        tx_pages.insert(new_leaf_id);
         let mut new_leaf = Page::new_leaf(new_leaf_id, old_leaf.aux_ptr());
         let new_count = count - 1;
 
@@ -70,11 +64,37 @@ impl<S: Storage> Index for BTreeIndex<S> {
         new_leaf.update_checksum();
 
         self.cache.write_page(new_leaf)?;
-        self.cache.free_page(leaf_id);
+        tx_pages.retire(leaf_id);
 
-        let new_root = self.propagate_up(path, leaf_id, new_leaf_id, None)?;
+        let new_root = self.propagate_up_in_tx(path, leaf_id, new_leaf_id, None, tx_pages)?;
         self.set_root_id(new_root);
         Ok(true)
+    }
+}
+
+impl<S: Storage> Index for BTreeIndex<S> {
+    /// Zero-copy point lookup. Single-lock traversal directly over in-page slices with zero 4KB copies and zero path allocations.
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.with_value(key, |val| Ok(val.to_vec()))
+    }
+
+    /// Copy-On-Write insert with slotted pages and automatic free-list page recycling.
+    fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        let mut tx_pages = TxPageSet::default();
+        let _ = self.insert_in_tx(key, val, &mut tx_pages)?;
+        for pid in tx_pages.retired {
+            self.cache.free_page(pid);
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<bool> {
+        let mut tx_pages = TxPageSet::default();
+        let res = self.remove_in_tx(key, &mut tx_pages)?;
+        for pid in tx_pages.retired {
+            self.cache.free_page(pid);
+        }
+        Ok(res)
     }
 
     /// Fast sequential cursor scan along leaf `aux_ptr` (`next_leaf`) links.

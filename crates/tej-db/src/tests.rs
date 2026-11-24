@@ -1,5 +1,27 @@
 use super::*;
 
+#[cfg(all(feature = "mmap", not(target_arch = "wasm32")))]
+#[test]
+fn test_mmap_normal_durability_reopen() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("test_reopen.db");
+
+    {
+        let db = Database::open_mmap(&db_path).unwrap();
+        db.set_durability(DurabilityMode::Normal);
+        let mut tx = db.begin_write().unwrap();
+        for i in 0..100 {
+            tx.put(format!("k_{i}").as_bytes(), format!("v_{i}").as_bytes())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let db = Database::open_mmap_with_capacity(&db_path, 16).unwrap();
+    let rx = db.begin_read().unwrap();
+    assert_eq!(rx.get(b"k_0").unwrap(), Some(b"v_0".to_vec()));
+}
+
 #[test]
 fn test_database_crud_lifecycle() {
     let db = Database::open_memory().unwrap();

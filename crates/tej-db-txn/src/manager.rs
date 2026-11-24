@@ -417,30 +417,46 @@ impl<S: Storage> TxManager<S> {
         }
 
         // Phase 5: Two-Phase Durability Flush Barrier
-        match self.durability() {
-            DurabilityMode::Immediate => {
-                let _ = self.cache.flush_data_pages();
-                let _ = self.cache.sync();
+        let durability_res = (|| -> Result<()> {
+            match self.durability() {
+                DurabilityMode::Immediate => {
+                    self.cache.flush_data_pages()?;
+                    self.cache.sync()?;
+                }
+                DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
+                    self.cache.flush_data_pages()?;
+                }
+                DurabilityMode::None => {}
             }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                let _ = self.cache.flush_data_pages();
-            }
-            DurabilityMode::None => {}
-        }
 
-        if self.durability() != DurabilityMode::None {
-            let tables = self.catalog.to_meta_entries();
-            let catalog_root = PageId(self.catalog_root.load(Ordering::Acquire));
-            let meta = MetaPage::with_tables(new_root, catalog_root, TxId(cur_next), tables);
-            let cur_sb = PageId(self.active_superblock.load(Ordering::Acquire));
-            let target_sb = crate::superblock::choose_commit_superblock(cur_sb, TxId(cur_next));
-            if crate::superblock::write_superblock(&self.cache, target_sb, &meta).is_ok() {
+            if self.durability() != DurabilityMode::None {
+                let tables = self.catalog.to_meta_entries();
+                let catalog_root = PageId(self.catalog_root.load(Ordering::Acquire));
+                let meta = MetaPage::with_tables(new_root, catalog_root, TxId(cur_next), tables);
+                let cur_sb = PageId(self.active_superblock.load(Ordering::Acquire));
+                let target_sb = crate::superblock::choose_commit_superblock(cur_sb, TxId(cur_next));
+                crate::superblock::write_superblock(&self.cache, target_sb, &meta)?;
                 self.active_superblock.store(target_sb.0, Ordering::Release);
-                let _ = self.cache.flush_page(target_sb);
+                self.cache.flush_page(target_sb)?;
                 if self.durability() == DurabilityMode::Immediate {
-                    let _ = self.cache.sync();
+                    self.cache.sync()?;
                 }
             }
+            Ok(())
+        })();
+
+        if let Err(e) = durability_res {
+            for &pid in &combined_pages.allocated {
+                self.cache.free_page(pid);
+            }
+            for (ticket, _) in &committed_slots {
+                let slot = self.ring_buffer.get_slot(*ticket);
+                slot.status
+                    .store(ring_buffer::SLOT_ABORTED, Ordering::Release);
+            }
+            self.ring_buffer.tail.store(scan_tail, Ordering::Release);
+            tracing::error!("Error committing cohort durability barrier: {e}");
+            return;
         }
 
         self.active_root.store(new_root.0, Ordering::Release);

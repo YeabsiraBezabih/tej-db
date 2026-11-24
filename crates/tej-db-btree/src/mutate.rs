@@ -433,16 +433,4 @@ impl<S: Storage> BTreeIndex<S> {
         }
         self.propagate_up_in_tx(path, parent_id, new_parent_id, None, tx_pages)
     }
-
-    /// Propagate a child page replacement and/or split up the parent ancestor chain under COW.
-    pub(crate) fn propagate_up(
-        &self,
-        path: Vec<PageId>,
-        old_child: PageId,
-        left_child: PageId,
-        split_opt: Option<(Vec<u8>, PageId)>,
-    ) -> Result<PageId> {
-        let mut tx_pages = TxPageSet::default();
-        self.propagate_up_in_tx(path, old_child, left_child, split_opt, &mut tx_pages)
-    }
 }

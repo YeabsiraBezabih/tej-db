@@ -54,6 +54,24 @@ pub struct ApiResponse<T> {
     pub error: Option<String>,
 }
 
+impl<T> ApiResponse<T> {
+    pub fn ok(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+
+    pub fn err(msg: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(msg.into()),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ApiStats {
     pub total_pages: u64,
@@ -394,35 +412,16 @@ pub async fn delete_item(
     match result {
         Ok(Ok(true)) => (
             StatusCode::OK,
-            Json(ApiResponse {
-                success: true,
-                data: Some(format!("Item '{id}' successfully deleted")),
-                error: None,
-            }),
+            Json(ApiResponse::ok(format!("Item '{id}' successfully deleted"))),
         ),
         Ok(Ok(false)) => (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Item '{id}' does not exist")),
-            }),
+            Json(ApiResponse::err(format!("Item '{id}' does not exist"))),
         ),
-        Ok(Err((status, msg))) => (
-            status,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(msg),
-            }),
-        ),
+        Ok(Err((status, msg))) => (status, Json(ApiResponse::err(msg))),
         Err(join_err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Worker panic: {join_err}")),
-            }),
+            Json(ApiResponse::err(format!("Worker panic: {join_err}"))),
         ),
     }
 }
@@ -448,48 +447,41 @@ pub async fn execute_sql(
     Json(payload): Json<SqlRequest>,
 ) -> impl IntoResponse {
     let sql_engine = Arc::clone(&state.sql);
-    let result = tokio::task::spawn_blocking(move || {
-        sql_engine
-            .execute(&payload.sql)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
-    })
-    .await;
+    let run_task = tokio::task::spawn_blocking(move || {
+        sql_engine.execute(&payload.sql).map_err(|e| {
+            let sanitized = match e {
+                tej_db_core::DbError::Io(_) => "Storage I/O error".into(),
+                _ => e.to_string(),
+            };
+            (StatusCode::BAD_REQUEST, sanitized)
+        })
+    });
 
-    match result {
-        Ok(Ok(query_res)) => {
+    let timeout_res = tokio::time::timeout(std::time::Duration::from_secs(10), run_task).await;
+    match timeout_res {
+        Ok(Ok(Ok(query_res))) => {
             let rows = query_res
                 .rows
                 .into_iter()
                 .map(|r| r.into_iter().map(value_to_json).collect())
                 .collect();
-            (
-                StatusCode::OK,
-                Json(ApiResponse {
-                    success: true,
-                    data: Some(SqlResponse {
-                        columns: query_res.columns,
-                        rows,
-                        affected_rows: query_res.rows_affected as u64,
-                    }),
-                    error: None,
-                }),
-            )
+            let data = SqlResponse {
+                columns: query_res.columns,
+                rows,
+                affected_rows: query_res.rows_affected as u64,
+            };
+            (StatusCode::OK, Json(ApiResponse::ok(data)))
         }
-        Ok(Err((status, msg))) => (
-            status,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(msg),
-            }),
-        ),
-        Err(join_err) => (
+        Ok(Ok(Err((status, msg)))) => (status, Json(ApiResponse::err(msg))),
+        Ok(Err(join_err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Task execution panicked: {join_err}")),
-            }),
+            Json(ApiResponse::err(format!(
+                "Execution task failed: {join_err}"
+            ))),
+        ),
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(ApiResponse::err("Query execution timed out (10s limit)")),
         ),
     }
 }

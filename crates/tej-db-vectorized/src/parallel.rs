@@ -320,7 +320,15 @@ pub fn parallel_hash_aggregate(
                 ThreadAggState::Count(c) => col.push_i64(*c as i64)?,
                 ThreadAggState::SumInt64(s) => col.push_i64(*s)?,
                 ThreadAggState::MinInt64(m) | ThreadAggState::MaxInt64(m) => col.push_i64(*m)?,
-                ThreadAggState::AvgFloat64 { .. } => col.push_i64(0)?,
+                ThreadAggState::AvgFloat64 { sum, count } => {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                    let avg = if *count > 0 {
+                        (*sum / (*count as f64)) as i64
+                    } else {
+                        0
+                    };
+                    col.push_i64(avg)?;
+                }
             }
         }
     }
@@ -355,7 +363,7 @@ pub fn parallel_tpch_q6(
                 let mut disc_buf = Vec::with_capacity(2048);
                 let mut ship_buf = Vec::with_capacity(2048);
                 let mut qty_buf = Vec::with_capacity(2048);
-                let mut sel_buf: Vec<u16> = vec![0u16; 2048];
+                let mut sel_buf: Vec<usize> = Vec::with_capacity(2048);
 
                 while let Some(morsel) = sched.next_morsel() {
                     let rg = &row_groups[morsel.row_group_idx];
@@ -375,6 +383,9 @@ pub fn parallel_tpch_q6(
                     let discounts = disc_buf.as_slice();
                     let quantities = qty_buf.as_slice();
                     let num_rows = shipdates.len().min(discounts.len()).min(quantities.len());
+                    if sel_buf.len() < num_rows {
+                        sel_buf.resize(num_rows, 0);
+                    }
 
                     let mut cnt = 0usize;
                     let mut i = 0;
@@ -383,40 +394,28 @@ pub fn parallel_tpch_q6(
                         let m0 = ((shipdates[i].wrapping_sub(19940101) as u64) < 10000)
                             & (((discounts[i].wrapping_sub(5)) as u64) <= 2)
                             & ((quantities[i] as u64) < 24);
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            sel_buf[cnt] = i as u16;
-                        }
+                        sel_buf[cnt] = i;
                         cnt += usize::from(m0);
 
                         #[allow(clippy::cast_sign_loss)]
                         let m1 = ((shipdates[i + 1].wrapping_sub(19940101) as u64) < 10000)
                             & (((discounts[i + 1].wrapping_sub(5)) as u64) <= 2)
                             & ((quantities[i + 1] as u64) < 24);
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            sel_buf[cnt] = (i + 1) as u16;
-                        }
+                        sel_buf[cnt] = i + 1;
                         cnt += usize::from(m1);
 
                         #[allow(clippy::cast_sign_loss)]
                         let m2 = ((shipdates[i + 2].wrapping_sub(19940101) as u64) < 10000)
                             & (((discounts[i + 2].wrapping_sub(5)) as u64) <= 2)
                             & ((quantities[i + 2] as u64) < 24);
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            sel_buf[cnt] = (i + 2) as u16;
-                        }
+                        sel_buf[cnt] = i + 2;
                         cnt += usize::from(m2);
 
                         #[allow(clippy::cast_sign_loss)]
                         let m3 = ((shipdates[i + 3].wrapping_sub(19940101) as u64) < 10000)
                             & (((discounts[i + 3].wrapping_sub(5)) as u64) <= 2)
                             & ((quantities[i + 3] as u64) < 24);
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            sel_buf[cnt] = (i + 3) as u16;
-                        }
+                        sel_buf[cnt] = i + 3;
                         cnt += usize::from(m3);
 
                         i += 4;
@@ -426,10 +425,7 @@ pub fn parallel_tpch_q6(
                         let m = ((shipdates[i].wrapping_sub(19940101) as u64) < 10000)
                             & (((discounts[i].wrapping_sub(5)) as u64) <= 2)
                             & ((quantities[i] as u64) < 24);
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            sel_buf[cnt] = i as u16;
-                        }
+                        sel_buf[cnt] = i;
                         cnt += usize::from(m);
                         i += 1;
                     }
@@ -443,7 +439,7 @@ pub fn parallel_tpch_q6(
                     let prices = prices_buf.as_slice();
                     local_count += cnt;
                     for &idx in &sel_buf[..cnt] {
-                        local_sum += prices[idx as usize];
+                        local_sum += prices[idx];
                     }
                 }
 

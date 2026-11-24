@@ -1,4 +1,4 @@
-use crate::simd::rabitq_asymmetric_dot_product;
+use crate::simd::{rabitq_asymmetric_dot_product, rabitq_asymmetric_dot_product_2bit};
 
 /// Quantization precision for RaBitQ encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -181,7 +181,14 @@ impl RaBitQQuantizer {
         alpha: f32,
         beta: f32,
     ) -> f32 {
-        rabitq_asymmetric_dot_product(rotated_query, code, alpha, beta)
+        match self.precision {
+            QuantizationPrecision::OneBit => {
+                rabitq_asymmetric_dot_product(rotated_query, code, alpha, beta)
+            }
+            QuantizationPrecision::TwoBit => {
+                rabitq_asymmetric_dot_product_2bit(rotated_query, code, alpha, beta)
+            }
+        }
     }
 
     /// Estimates the L2 squared distance: $\|\mathbf{q} - \mathbf{x}\|^2 = \|\mathbf{q}\|^2 + \|\mathbf{x}\|^2 - 2 \langle \mathbf{q}, \mathbf{x} \rangle$.
@@ -288,9 +295,18 @@ mod tests {
         let quantizer = RaBitQQuantizer::new_with_precision(dim, 42, QuantizationPrecision::TwoBit);
 
         let v1 = vec![0.5f32; dim];
-        let (code, alpha, _beta, norm) = quantizer.quantize(&v1);
+        let (code, alpha, beta, norm) = quantizer.quantize(&v1);
         assert_eq!(code.len(), quantizer.effective_dim.div_ceil(4));
         assert!(alpha >= 0.0);
         assert!((norm - (dim as f32 * 0.25).sqrt()).abs() < 1e-4);
+
+        let q = vec![0.5f32; dim];
+        let rot_q = quantizer.rotate(&q);
+        let q_norm_sq = q.iter().map(|x| x * x).sum::<f32>();
+        let est_dist = quantizer.estimate_l2_distance(&rot_q, q_norm_sq, &code, alpha, beta, norm);
+        assert!(
+            est_dist < 5.0,
+            "Expected 2-bit quantization to yield accurate low distance, got {est_dist}"
+        );
     }
 }

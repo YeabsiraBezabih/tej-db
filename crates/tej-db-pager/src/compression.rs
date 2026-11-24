@@ -1,6 +1,3 @@
-#[cfg(feature = "compression")]
-use alloc::format;
-use alloc::vec::Vec;
 use tej_db_core::{DbError, PAGE_SIZE, PageId, Result, Storage};
 
 /// Magic identifier for compressed pages: "LZ4P".
@@ -31,7 +28,7 @@ pub fn decompress_page(src: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut dst = alloc::vec![0u8; uncomp_size];
+    let mut dst = vec![0u8; uncomp_size];
     let decomp_len = lz4_flex::block::decompress_into(&src[4..], &mut dst)
         .map_err(|e| DbError::Corruption(format!("LZ4 decompression failed: {e}")))?;
 
@@ -114,7 +111,7 @@ impl<S: Storage> Storage for CompressedStorage<S> {
         }
     }
 
-    fn sync(&mut self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         self.inner.sync()
     }
 

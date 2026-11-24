@@ -44,7 +44,7 @@ impl Storage for MemStorage {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         // In-memory writes are immediately in memory; no fsync needed.
         Ok(())
     }

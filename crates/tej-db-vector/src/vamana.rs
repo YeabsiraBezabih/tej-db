@@ -72,7 +72,9 @@ impl<S: Storage> VamanaSearcher<S> {
 
         visited.insert(entry_point);
         candidates.push(std::cmp::Reverse(entry_cand));
-        if predicate_filter.is_none_or(|f| f(entry_cand.vector_id)) {
+        if !entry_node.metadata.is_deleted
+            && predicate_filter.is_none_or(|f| f(entry_cand.vector_id))
+        {
             top_k.push(entry_cand);
         }
 

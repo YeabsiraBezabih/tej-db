@@ -23,7 +23,7 @@ pub use rabitq::{QuantizationPrecision, RaBitQQuantizer};
 pub use scratch::SearchScratch;
 pub use simd::{
     cosine_distance, dot_product, l2_distance_squared, rabitq_asymmetric_dot_product,
-    rabitq_hamming_distance,
+    rabitq_asymmetric_dot_product_2bit, rabitq_hamming_distance,
 };
 pub use types::{DistanceMetric, SearchCandidate, VectorId, VectorNodeMetadata};
 pub use vamana::VamanaSearcher;

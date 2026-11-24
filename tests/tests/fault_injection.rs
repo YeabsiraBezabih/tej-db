@@ -47,7 +47,7 @@ impl Storage for CorruptingStorage {
         self.inner.write_page(id, buf)
     }
 
-    fn sync(&mut self) -> Result<()> {
+    fn sync(&self) -> Result<()> {
         self.inner.sync()
     }
 

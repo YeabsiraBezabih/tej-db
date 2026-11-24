@@ -119,6 +119,39 @@ pub fn rabitq_asymmetric_dot_product(
     alpha * (2.0 * bit_sum - q_sum) + beta * q_sum
 }
 
+#[must_use]
+pub fn rabitq_asymmetric_dot_product_2bit(
+    rotated_query: &[f32],
+    code: &[u8],
+    alpha: f32,
+    beta: f32,
+) -> f32 {
+    let dim = rotated_query.len();
+    let mut bit_sum = 0.0f32;
+    let mut q_sum = 0.0f32;
+
+    for &q in rotated_query {
+        q_sum += q;
+    }
+
+    for (byte_idx, &byte_val) in code.iter().enumerate() {
+        let base_elem = byte_idx * 4;
+        if base_elem >= dim {
+            break;
+        }
+
+        let limit = (dim - base_elem).min(4);
+        for slot in 0..limit {
+            let b_val = f32::from((byte_val >> (slot * 2)) & 3);
+            if b_val > 0.0 {
+                bit_sum += rotated_query[base_elem + slot] * b_val;
+            }
+        }
+    }
+
+    alpha * (2.0 * bit_sum - 3.0 * q_sum) + beta * q_sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

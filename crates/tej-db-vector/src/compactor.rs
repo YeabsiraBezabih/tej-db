@@ -1,7 +1,7 @@
 use crate::delta::{delta_table_name, scan_vector_delta};
 use crate::node::VectorNode;
 use crate::rabitq::RaBitQQuantizer;
-use crate::types::{DEFAULT_ALPHA_PRUNING, DEFAULT_DEGREE_R, MAX_DEGREE_R};
+use crate::types::{DEFAULT_ALPHA_PRUNING, DEFAULT_DEGREE_R, MAX_DEGREE_R, VectorId};
 use crate::vamana::VamanaSearcher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,7 +107,12 @@ impl<S: Storage> VectorCompactor<S> {
                 self.manager.cache().write_page(page)?;
                 committed_ids.push(delta.vector_id);
             } else {
-                // Tombstone deletion
+                // Tombstone deletion: mark node as deleted in the Vamana graph
+                if active_root.is_valid() {
+                    if let Some(alt_root) = self.mark_node_deleted(active_root, delta.vector_id) {
+                        active_root = alt_root;
+                    }
+                }
                 committed_ids.push(delta.vector_id);
             }
         }
@@ -125,6 +130,47 @@ impl<S: Storage> VectorCompactor<S> {
         tx.commit()?;
 
         Ok(active_root)
+    }
+
+    fn mark_node_deleted(&self, root: PageId, target_id: VectorId) -> Option<PageId> {
+        let mut queue = std::collections::VecDeque::new();
+        let mut visited = std::collections::HashSet::new();
+        queue.push_back(root);
+        visited.insert(root);
+
+        while let Some(pid) = queue.pop_front() {
+            let mut found = false;
+            let is_root = pid == root;
+            let mut fallback_root = None;
+            let mut neighbors = smallvec::SmallVec::<[PageId; MAX_DEGREE_R]>::new();
+
+            let _ = self.manager.cache().with_page_mut(pid, |p| {
+                if let Ok(mut node) = VectorNode::from_page(p) {
+                    if node.metadata.vector_id == target_id {
+                        node.metadata.is_deleted = true;
+                        let _ = node.write_to_page(pid, p);
+                        found = true;
+                        if is_root {
+                            fallback_root = node.neighbors.first().copied();
+                        }
+                    } else {
+                        neighbors.clone_from(&node.neighbors);
+                    }
+                }
+                Ok(())
+            });
+
+            if found {
+                return fallback_root;
+            }
+
+            for nb in neighbors {
+                if nb.is_valid() && visited.insert(nb) {
+                    queue.push_back(nb);
+                }
+            }
+        }
+        None
     }
 
     /// Signals the background compactor to gracefully shut down.

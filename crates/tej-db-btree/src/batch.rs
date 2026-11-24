@@ -1,5 +1,5 @@
 use crate::{BTreeIndex, InlineKey, InlineVal, RawBatchItem, TxPageSet};
-use tej_db_core::{Index, PageId, Result, Storage};
+use tej_db_core::{PageId, Result, Storage};
 
 impl<S: Storage> BTreeIndex<S> {
     pub fn insert_sorted_batch_in_tx(
@@ -37,7 +37,7 @@ impl<S: Storage> BTreeIndex<S> {
                 cursor_path = None;
                 cursor_upper_bound = None;
                 last_key = None;
-                let _ = self.remove(key)?;
+                let _ = self.remove_in_tx(key, tx_pages)?;
                 idx += 1;
                 continue;
             };

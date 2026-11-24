@@ -62,8 +62,17 @@ pub struct TejReadTxHandle(pub(crate) ReadTxInstance);
 
 /// Self-contained owned write transaction wrapper holding its parent database instance.
 pub struct OwnedWriteTx<S: Storage> {
-    db: Database<S>,
+    // Drop order is critical: `tx` MUST be dropped before `db` so that `WriteTx::drop`
+    // runs while `Database<S>` (and its internal `TxManager`) is still alive.
     tx: Option<WriteTx<'static, S>>,
+    db: Database<S>,
+}
+
+impl<S: Storage> Drop for OwnedWriteTx<S> {
+    fn drop(&mut self) {
+        // Explicitly drop the transaction before `db` is freed.
+        drop(self.tx.take());
+    }
 }
 
 impl<S: Storage> std::fmt::Debug for OwnedWriteTx<S> {
@@ -77,7 +86,7 @@ impl<S: Storage> std::fmt::Debug for OwnedWriteTx<S> {
 impl<S: Storage> OwnedWriteTx<S> {
     /// Creates a new owned write transaction bound to `db`.
     pub fn new(db: Database<S>) -> DbResult<Self> {
-        let mut owned = Self { db, tx: None };
+        let mut owned = Self { tx: None, db };
         let tx = owned.db.begin_write()?;
         // SAFETY: The parent `Database<S>` is stored within `db` and will remain alive
         // for the entire lifetime of `tx`. The handle is pinned on the heap when exposed to C.

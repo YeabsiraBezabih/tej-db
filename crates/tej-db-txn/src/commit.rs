@@ -13,101 +13,13 @@ use tej_db_btree::{BTreeIndex, RawBatchItem};
 use tej_db_core::{DbError, DurabilityMode, PageId, Result, Storage, TxId};
 
 impl<S: Storage> WriteTx<'_, S> {
-    pub(crate) fn commit_single(
+    pub(crate) fn commit_leader_and_cohort(
         &mut self,
         _guard: &AdaptiveSpinGuard<'_>,
         pending: &[RawBatchItem],
     ) -> Result<TxId> {
-        let cur_next = self.manager.next_tx_id.load(Ordering::Acquire);
-        let cur_root = PageId(self.manager.active_root.load(Ordering::Acquire));
-        let mut target_btree = if cur_next == self.snapshot_tx_id.0 + 1 {
-            self.btree.clone()
-        } else {
-            let history = self.manager.commit_history.read();
-            validate_tx_conflict(
-                &history,
-                self.snapshot_tx_id,
-                &self.modified_tables,
-                pending,
-            )?;
-            BTreeIndex::new(Arc::clone(&self.manager.cache), Some(cur_root))?
-        };
-
-        target_btree.insert_sorted_batch_raw_in_tx(pending, &mut self.tx_pages)?;
-        let new_root = target_btree.root_id();
-
-        let commit_tx_id = cur_next;
-        let new_next = commit_tx_id + 1;
-
-        let leader_keys: Arc<[tej_db_btree::InlineKey]> =
-            pending.iter().map(|item| item.0.clone()).collect();
-        {
-            let mut history = self.manager.commit_history.write();
-            history.push_back(CommittedTxRecord {
-                tx_id: TxId(commit_tx_id),
-                tables: self.modified_tables.clone(),
-                keys: leader_keys,
-            });
-            if history.len() > 2048 {
-                history.pop_front();
-            }
-        }
-
-        // Durability Barrier Phase 1: Flush all modified data pages and sync before updating superblock
-        match self.manager.durability() {
-            DurabilityMode::Immediate => {
-                self.manager.cache.flush_data_pages()?;
-                self.manager.cache.sync()?;
-            }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                self.manager.cache.flush_data_pages()?;
-            }
-            DurabilityMode::None => {}
-        }
-
-        // Durability Barrier Phase 2: Write and flush alternating superblock
-        if self.manager.durability() != DurabilityMode::None {
-            let tables = self.manager.catalog.to_meta_entries();
-            let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
-            let meta = MetaPage::with_tables(new_root, catalog_root, TxId(new_next), tables);
-            let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
-            let target_sb = crate::superblock::choose_commit_superblock(cur_sb, TxId(new_next));
-            crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
-            self.manager
-                .active_superblock
-                .store(target_sb.0, Ordering::Release);
-
-            self.manager.cache.flush_page(target_sb)?;
-            if self.manager.durability() == DurabilityMode::Immediate {
-                self.manager.cache.sync()?;
-            }
-        }
-
-        self.manager
-            .active_root
-            .store(new_root.0, Ordering::Release);
-        self.manager.next_tx_id.store(new_next, Ordering::Release);
-
-        // Safe reclamation: free retired pages after superblock sync
-        for pid in self.tx_pages.retired.drain(..) {
-            self.manager.cache.free_page(pid);
-        }
-
-        Ok(TxId(commit_tx_id))
-    }
-
-    pub(crate) fn commit_leader_and_cohort(
-        &mut self,
-        guard: &AdaptiveSpinGuard<'_>,
-        pending: &[RawBatchItem],
-    ) -> Result<TxId> {
         let cur_tail = self.manager.ring_buffer.tail.load(Ordering::Relaxed);
         let cur_head = self.manager.ring_buffer.head.load(Ordering::Acquire);
-
-        // Fast path for isolated single-writer without waiting followers
-        if cur_tail == cur_head {
-            return self.commit_single(guard, pending);
-        }
 
         let cur_next = self.manager.next_tx_id.load(Ordering::Acquire);
         let cur_root = PageId(self.manager.active_root.load(Ordering::Acquire));
@@ -277,35 +189,56 @@ impl<S: Storage> WriteTx<'_, S> {
             }
         }
 
-        // Durability Barrier Phase 1: Flush data pages and sync before superblock update
-        match self.manager.durability() {
-            DurabilityMode::Immediate => {
-                self.manager.cache.flush_data_pages()?;
-                self.manager.cache.sync()?;
+        // Durability Barrier Phase 1 & Phase 2
+        let durability_res = (|| -> Result<()> {
+            match self.manager.durability() {
+                DurabilityMode::Immediate => {
+                    self.manager.cache.flush_data_pages()?;
+                    self.manager.cache.sync()?;
+                }
+                DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
+                    self.manager.cache.flush_data_pages()?;
+                }
+                DurabilityMode::None => {}
             }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                self.manager.cache.flush_data_pages()?;
-            }
-            DurabilityMode::None => {}
-        }
 
-        // Durability Barrier Phase 2: Write and flush alternating superblock
-        if self.manager.durability() != DurabilityMode::None {
-            let tables = self.manager.catalog.to_meta_entries();
-            let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
-            let meta = MetaPage::with_tables(new_root, catalog_root, TxId(next_assign_tx), tables);
-            let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
-            let target_sb =
-                crate::superblock::choose_commit_superblock(cur_sb, TxId(next_assign_tx));
-            crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
-            self.manager
-                .active_superblock
-                .store(target_sb.0, Ordering::Release);
+            if self.manager.durability() != DurabilityMode::None {
+                let tables = self.manager.catalog.to_meta_entries();
+                let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
+                let meta =
+                    MetaPage::with_tables(new_root, catalog_root, TxId(next_assign_tx), tables);
+                let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
+                let target_sb =
+                    crate::superblock::choose_commit_superblock(cur_sb, TxId(next_assign_tx));
+                crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
+                self.manager
+                    .active_superblock
+                    .store(target_sb.0, Ordering::Release);
 
-            self.manager.cache.flush_page(target_sb)?;
-            if self.manager.durability() == DurabilityMode::Immediate {
-                self.manager.cache.sync()?;
+                self.manager.cache.flush_page(target_sb)?;
+                if self.manager.durability() == DurabilityMode::Immediate {
+                    self.manager.cache.sync()?;
+                }
             }
+            Ok(())
+        })();
+
+        if let Err(e) = durability_res {
+            for &pid in &combined_pages.allocated {
+                self.manager.cache.free_page(pid);
+            }
+            for (ticket, _) in &committed_slots {
+                let slot = self.manager.ring_buffer.get_slot(*ticket);
+                slot.status
+                    .store(ring_buffer::SLOT_ABORTED, Ordering::Release);
+            }
+            if !cohort_tickets.is_empty() {
+                self.manager
+                    .ring_buffer
+                    .tail
+                    .store(scan_tail, Ordering::Release);
+            }
+            return Err(e);
         }
 
         self.manager
@@ -375,7 +308,6 @@ impl<S: Storage> WriteTx<'_, S> {
         if let Some(commit_guard) = self.manager.commit_lock.try_lock() {
             let res = self.commit_leader_and_cohort(&commit_guard, &pending);
             if res.is_err() {
-                self.manager.drain_and_commit_cohort(&commit_guard);
                 drop(commit_guard);
                 return res.map(|_| ());
             }

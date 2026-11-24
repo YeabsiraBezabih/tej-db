@@ -254,16 +254,92 @@ fn extract_pk_equality(expr: &SqlExpr, pk_col: &str) -> Option<Value> {
     {
         if let (SqlExpr::Identifier(id), SqlExpr::Value(v)) = (left.as_ref(), right.as_ref()) {
             if id.value.eq_ignore_ascii_case(pk_col) {
-                return parse_sql_value(v);
+                let parsed = parse_sql_value(v)?;
+                if parsed.is_null() {
+                    return None;
+                }
+                return Some(parsed);
             }
         }
         if let (SqlExpr::Value(v), SqlExpr::Identifier(id)) = (left.as_ref(), right.as_ref()) {
             if id.value.eq_ignore_ascii_case(pk_col) {
-                return parse_sql_value(v);
+                let parsed = parse_sql_value(v)?;
+                if parsed.is_null() {
+                    return None;
+                }
+                return Some(parsed);
             }
         }
     }
     None
+}
+
+fn max_start_bound(b1: Bound<Vec<u8>>, b2: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
+    match (b1, b2) {
+        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
+        (Bound::Included(k1), Bound::Included(k2)) => {
+            if k1 >= k2 {
+                Bound::Included(k1)
+            } else {
+                Bound::Included(k2)
+            }
+        }
+        (Bound::Excluded(k1), Bound::Excluded(k2)) => {
+            if k1 >= k2 {
+                Bound::Excluded(k1)
+            } else {
+                Bound::Excluded(k2)
+            }
+        }
+        (Bound::Included(k1), Bound::Excluded(k2)) => {
+            if k1 > k2 {
+                Bound::Included(k1)
+            } else {
+                Bound::Excluded(k2)
+            }
+        }
+        (Bound::Excluded(k1), Bound::Included(k2)) => {
+            if k1 >= k2 {
+                Bound::Excluded(k1)
+            } else {
+                Bound::Included(k2)
+            }
+        }
+    }
+}
+
+fn min_end_bound(b1: Bound<Vec<u8>>, b2: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
+    match (b1, b2) {
+        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
+        (Bound::Included(k1), Bound::Included(k2)) => {
+            if k1 <= k2 {
+                Bound::Included(k1)
+            } else {
+                Bound::Included(k2)
+            }
+        }
+        (Bound::Excluded(k1), Bound::Excluded(k2)) => {
+            if k1 <= k2 {
+                Bound::Excluded(k1)
+            } else {
+                Bound::Excluded(k2)
+            }
+        }
+        (Bound::Included(k1), Bound::Excluded(k2)) => {
+            if k1 < k2 {
+                Bound::Included(k1)
+            } else {
+                Bound::Excluded(k2)
+            }
+        }
+        (Bound::Excluded(k1), Bound::Included(k2)) => {
+            if k1 <= k2 {
+                Bound::Excluded(k1)
+            } else {
+                Bound::Included(k2)
+            }
+        }
+    }
 }
 
 #[allow(clippy::type_complexity, clippy::single_match)]
@@ -276,6 +352,13 @@ fn extract_pk_range(
             if let (SqlExpr::Identifier(id), SqlExpr::Value(v)) = (left.as_ref(), right.as_ref()) {
                 if id.value.eq_ignore_ascii_case(pk_col) {
                     let val = parse_sql_value(v)?;
+                    if val.is_null() {
+                        return Some((
+                            Bound::Excluded(Vec::new()),
+                            Bound::Included(Vec::new()),
+                            None,
+                        ));
+                    }
                     let enc = val.encode_key();
                     match op {
                         BinaryOperator::Gt => {
@@ -304,14 +387,8 @@ fn extract_pk_range(
                     extract_pk_range(l_box, pk_col),
                     extract_pk_range(r_box, pk_col),
                 ) {
-                    let start = match (s1, s2) {
-                        (Bound::Unbounded, s) | (s, Bound::Unbounded) => s,
-                        (s1, _) => s1,
-                    };
-                    let end = match (e1, e2) {
-                        (Bound::Unbounded, e) | (e, Bound::Unbounded) => e,
-                        (e1, _) => e1,
-                    };
+                    let start = max_start_bound(s1, s2);
+                    let end = min_end_bound(e1, e2);
                     return Some((start, end, None));
                 }
             }

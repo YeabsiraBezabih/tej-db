@@ -13,13 +13,16 @@ impl<S: Storage> PageCache<S> {
         for (s_idx, shard) in self.shards.iter().enumerate() {
             if (mask & (1 << s_idx)) != 0 {
                 let mut state = shard.state.write();
-                let dirty_ids = std::mem::take(&mut state.dirty_pages);
-                for id in dirty_ids {
-                    if let Some(entry) = state.entries.get_mut(&id) {
+                let CacheShardState {
+                    dirty_pages: shard_dirty,
+                    entries,
+                    ..
+                } = &mut *state;
+                for &id in shard_dirty.iter() {
+                    if let Some(entry) = entries.get_mut(&id) {
                         if entry.is_dirty {
                             entry.page.update_checksum();
                             dirty_pages.push((id, entry.page.clone()));
-                            entry.is_dirty = false;
                         }
                     }
                 }
@@ -33,29 +36,51 @@ impl<S: Storage> PageCache<S> {
         dirty_pages.sort_unstable_by_key(|(id, _)| *id);
         dirty_pages.dedup_by_key(|(id, _)| *id);
 
-        let mut storage = self.storage.write();
-        let mut i = 0;
-        let n = dirty_pages.len();
-        let mut extent_buf = Vec::with_capacity(64 * PAGE_SIZE);
+        let write_res = (|| -> Result<()> {
+            let mut storage = self.storage.write();
+            let mut i = 0;
+            let n = dirty_pages.len();
+            let mut extent_buf = Vec::with_capacity(64 * PAGE_SIZE);
 
-        while i < n {
-            let start_id = dirty_pages[i].0;
-            let mut run_len = 1;
-            while i + run_len < n && dirty_pages[i + run_len].0.0 == start_id.0 + run_len as u64 {
-                run_len += 1;
-            }
-
-            if run_len == 1 {
-                storage.write_page(start_id, dirty_pages[i].1.as_slice())?;
-            } else {
-                extent_buf.clear();
-                extent_buf.reserve(run_len * PAGE_SIZE);
-                for j in 0..run_len {
-                    extent_buf.extend_from_slice(dirty_pages[i + j].1.as_slice());
+            while i < n {
+                let start_id = dirty_pages[i].0;
+                let mut run_len = 1;
+                while i + run_len < n && dirty_pages[i + run_len].0.0 == start_id.0 + run_len as u64
+                {
+                    run_len += 1;
                 }
-                storage.write_pages(start_id, &extent_buf)?;
+
+                if run_len == 1 {
+                    storage.write_page(start_id, dirty_pages[i].1.as_slice())?;
+                } else {
+                    extent_buf.clear();
+                    extent_buf.reserve(run_len * PAGE_SIZE);
+                    for j in 0..run_len {
+                        extent_buf.extend_from_slice(dirty_pages[i + j].1.as_slice());
+                    }
+                    storage.write_pages(start_id, &extent_buf)?;
+                }
+                i += run_len;
             }
-            i += run_len;
+            Ok(())
+        })();
+
+        if let Err(e) = write_res {
+            self.dirty_shard_mask.fetch_or(mask, Ordering::Release);
+            return Err(e);
+        }
+
+        // Only clear dirty state after storage writes succeed
+        for (s_idx, shard) in self.shards.iter().enumerate() {
+            if (mask & (1 << s_idx)) != 0 {
+                let mut state = shard.state.write();
+                let dirty_ids = std::mem::take(&mut state.dirty_pages);
+                for id in dirty_ids {
+                    if let Some(entry) = state.entries.get_mut(&id) {
+                        entry.is_dirty = false;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -73,17 +98,19 @@ impl<S: Storage> PageCache<S> {
         for (s_idx, shard) in self.shards.iter().enumerate() {
             if (mask & (1 << s_idx)) != 0 {
                 let mut state = shard.state.write();
-                let dirty_ids = std::mem::take(&mut state.dirty_pages);
-                for id in dirty_ids {
+                let CacheShardState {
+                    dirty_pages: shard_dirty,
+                    entries,
+                    ..
+                } = &mut *state;
+                for &id in shard_dirty.iter() {
                     if id.0 < 2 {
-                        state.dirty_pages.push(id);
                         continue;
                     }
-                    if let Some(entry) = state.entries.get_mut(&id) {
+                    if let Some(entry) = entries.get_mut(&id) {
                         if entry.is_dirty {
                             entry.page.update_checksum();
                             dirty_pages.push((id, entry.page.clone()));
-                            entry.is_dirty = false;
                         }
                     }
                 }
@@ -121,6 +148,29 @@ impl<S: Storage> PageCache<S> {
             }
             i += run_len;
         }
+        drop(storage);
+
+        // Only clear data pages' dirty state after storage write succeeds
+        for (s_idx, shard) in self.shards.iter().enumerate() {
+            if (mask & (1 << s_idx)) != 0 {
+                let mut state = shard.state.write();
+                let CacheShardState {
+                    dirty_pages: shard_dirty,
+                    entries,
+                    ..
+                } = &mut *state;
+                shard_dirty.retain(|id| {
+                    if id.0 >= 2 {
+                        if let Some(entry) = entries.get_mut(id) {
+                            entry.is_dirty = false;
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
@@ -132,13 +182,13 @@ impl<S: Storage> PageCache<S> {
         let shard = &self.shards[shard_idx];
         let mut state = shard.state.write();
 
-        state.dirty_pages.retain(|&pid| pid != id);
         if let Some(entry) = state.entries.get_mut(&id) {
             if entry.is_dirty {
                 entry.page.update_checksum();
-                entry.is_dirty = false;
                 let mut storage = self.storage.write();
                 storage.write_page(id, entry.page.as_slice())?;
+                entry.is_dirty = false;
+                state.dirty_pages.retain(|&pid| pid != id);
             }
         }
         Ok(())
@@ -150,7 +200,7 @@ impl<S: Storage> PageCache<S> {
     }
 
     pub fn sync(&self) -> Result<()> {
-        let mut storage = self.storage.write();
+        let storage = self.storage.read();
         storage.sync()
     }
 

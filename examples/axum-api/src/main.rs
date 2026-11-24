@@ -39,6 +39,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/items/{id}", get(get_item).delete(delete_item))
         .route("/api/stats", get(get_stats))
         .route("/api/sql", post(execute_sql))
+        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

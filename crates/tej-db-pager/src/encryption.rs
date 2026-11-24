@@ -3,15 +3,11 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use core::fmt;
-use parking_lot::Mutex;
 use tej_db_core::{DbError, PAGE_SIZE, PageId, Result, Storage};
 use zeroize::Zeroizing;
 
 const NONCE_SIZE: usize = 12;
 const TAG_SIZE: usize = 16;
-const ENTRY_SIZE: usize = 32; // 12-byte nonce + 16-byte tag + 4-byte reserved
-const TAGS_PER_PAGE: u64 = (PAGE_SIZE / ENTRY_SIZE) as u64; // 128 entries per 4096-byte page
-const STRIDE: u64 = TAGS_PER_PAGE + 1; // 1 tag page + 128 data pages = 129 physical pages
 
 /// Encrypt raw bytes with ChaCha20-Poly1305 using a 256-bit key, 96-bit nonce, and optional AAD.
 #[cfg(feature = "encryption")]
@@ -43,23 +39,12 @@ pub fn decrypt_page_data(
         .map_err(|e| DbError::Corruption(format!("Page decryption failed: {e}")))
 }
 
+/// 1:1 physical page mapping: Each logical page `k` maps to dedicated physical tag page `2*k`
+/// and dedicated physical ciphertext page `2*k + 1`. This completely isolates tag pages across
+/// all pages, eliminating torn writes, read-modify-write races, and adjacent page corruption.
 #[inline]
-fn logical_to_physical_ids(logical_id: PageId) -> (PageId, PageId, usize) {
-    if logical_id.0 == 0 {
-        // Superblock 0: dedicated tag Page 0 and ciphertext data Page 1
-        (PageId(0), PageId(1), 0)
-    } else if logical_id.0 == 1 {
-        // Superblock 1: dedicated tag Page 2 and ciphertext data Page 3 (physically isolated from SB0)
-        (PageId(2), PageId(3), 0)
-    } else {
-        // Regular data pages start at physical base 4
-        let rel_id = logical_id.0 - 2;
-        let group = rel_id / TAGS_PER_PAGE;
-        let offset_in_group = (rel_id % TAGS_PER_PAGE) as usize;
-        let tag_pid = PageId(4 + group * STRIDE);
-        let data_pid = PageId(4 + group * STRIDE + 1 + offset_in_group as u64);
-        (tag_pid, data_pid, offset_in_group)
-    }
+fn logical_to_physical_ids(logical_id: PageId) -> (PageId, PageId) {
+    (PageId(2 * logical_id.0), PageId(2 * logical_id.0 + 1))
 }
 
 /// Generate a fresh cryptographically secure random 96-bit nonce.
@@ -73,14 +58,13 @@ fn generate_random_nonce() -> Result<[u8; 12]> {
 /// Transparent authenticated per-page ChaCha20-Poly1305 encryption storage wrapper.
 ///
 /// Stores full 4096-byte page ciphertexts in dedicated data pages and persists their
-/// fresh 12-byte CSPRNG nonces and 16-byte Poly1305 authentication tags in interleaved
-/// metadata catalog pages. The logical `PageId` is strictly bound into the AEAD Additional
+/// fresh 12-byte CSPRNG nonces and 16-byte Poly1305 authentication tags in dedicated
+/// 1:1 physical tag pages. The logical `PageId` is strictly bound into the AEAD Additional
 /// Authenticated Data (AAD) to prevent page-swapping and ciphertext relocation attacks.
 #[cfg(feature = "encryption")]
 pub struct EncryptedStorage<S: Storage> {
     inner: S,
     key: Zeroizing<[u8; 32]>,
-    tag_cache: Mutex<Option<(PageId, [u8; PAGE_SIZE], bool)>>, // (tag_pid, page_buf, is_dirty)
 }
 
 #[cfg(feature = "encryption")]
@@ -98,90 +82,11 @@ impl<S: Storage> EncryptedStorage<S> {
         Self {
             inner,
             key: Zeroizing::new(key),
-            tag_cache: Mutex::new(None),
         }
     }
 
-    pub fn into_inner(mut self) -> S {
-        let _ = self.flush_tag_cache();
+    pub fn into_inner(self) -> S {
         self.inner
-    }
-
-    fn flush_tag_cache(&mut self) -> Result<()> {
-        let mut cache_guard = self.tag_cache.lock();
-        if let Some((tag_pid, buf, is_dirty)) = cache_guard.take() {
-            if is_dirty {
-                self.inner.write_page(tag_pid, &buf)?;
-            }
-            *cache_guard = Some((tag_pid, buf, false));
-        }
-        Ok(())
-    }
-
-    fn load_tag_page(&self, tag_pid: PageId, out: &mut [u8; PAGE_SIZE]) -> Result<()> {
-        let mut cache_guard = self.tag_cache.lock();
-        if let Some((cached_pid, buf, _)) = *cache_guard {
-            if cached_pid == tag_pid {
-                out.copy_from_slice(&buf);
-                return Ok(());
-            }
-        }
-
-        if tag_pid.0 < self.inner.page_count() {
-            self.inner.read_page(tag_pid, out)?;
-        } else {
-            out.fill(0);
-        }
-
-        *cache_guard = Some((tag_pid, *out, false));
-        Ok(())
-    }
-
-    fn write_tag_and_nonce(
-        &mut self,
-        tag_pid: PageId,
-        slot: usize,
-        nonce: &[u8; 12],
-        tag: &[u8; 16],
-    ) -> Result<()> {
-        let mut page_buf = [0u8; PAGE_SIZE];
-        let mut cache_guard = self.tag_cache.lock();
-
-        let mut hit = false;
-        if let Some((cached_pid, ref buf, _)) = *cache_guard {
-            if cached_pid == tag_pid {
-                page_buf.copy_from_slice(buf);
-                hit = true;
-            }
-        }
-
-        if !hit {
-            if tag_pid.0 < self.inner.page_count() {
-                self.inner.read_page(tag_pid, &mut page_buf)?;
-            } else {
-                page_buf.fill(0);
-            }
-        }
-
-        let start = slot * ENTRY_SIZE;
-        page_buf[start..start + NONCE_SIZE].copy_from_slice(nonce);
-        page_buf[start + NONCE_SIZE..start + NONCE_SIZE + TAG_SIZE].copy_from_slice(tag);
-        page_buf[start + NONCE_SIZE + TAG_SIZE..start + ENTRY_SIZE].fill(0);
-
-        self.inner.write_page(tag_pid, &page_buf)?;
-        *cache_guard = Some((tag_pid, page_buf, false));
-        Ok(())
-    }
-
-    fn read_tag_and_nonce(&self, tag_pid: PageId, slot: usize) -> Result<([u8; 12], [u8; 16])> {
-        let mut page_buf = [0u8; PAGE_SIZE];
-        self.load_tag_page(tag_pid, &mut page_buf)?;
-        let start = slot * ENTRY_SIZE;
-        let mut nonce = [0u8; 12];
-        let mut tag = [0u8; 16];
-        nonce.copy_from_slice(&page_buf[start..start + NONCE_SIZE]);
-        tag.copy_from_slice(&page_buf[start + NONCE_SIZE..start + NONCE_SIZE + TAG_SIZE]);
-        Ok((nonce, tag))
     }
 }
 
@@ -192,8 +97,14 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             return Err(DbError::Custom("Buffer size must equal PAGE_SIZE".into()));
         }
 
-        let (tag_pid, data_pid, slot) = logical_to_physical_ids(id);
-        let (nonce, tag) = self.read_tag_and_nonce(tag_pid, slot)?;
+        let (tag_pid, data_pid) = logical_to_physical_ids(id);
+        let mut tag_page = [0u8; PAGE_SIZE];
+        self.inner.read_page(tag_pid, &mut tag_page)?;
+
+        let mut nonce = [0u8; NONCE_SIZE];
+        let mut tag = [0u8; TAG_SIZE];
+        nonce.copy_from_slice(&tag_page[..NONCE_SIZE]);
+        tag.copy_from_slice(&tag_page[NONCE_SIZE..NONCE_SIZE + TAG_SIZE]);
 
         let mut cipher_page = [0u8; PAGE_SIZE];
         self.inner.read_page(data_pid, &mut cipher_page)?;
@@ -220,7 +131,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             return Err(DbError::Custom("Buffer size must equal PAGE_SIZE".into()));
         }
 
-        let (tag_pid, data_pid, slot) = logical_to_physical_ids(id);
+        let (tag_pid, data_pid) = logical_to_physical_ids(id);
         let nonce = generate_random_nonce()?;
         let aad = id.0.to_le_bytes();
 
@@ -232,11 +143,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         }
 
         let cipher_body = &cipher_with_tag[..PAGE_SIZE];
-        let tag: [u8; 16] = cipher_with_tag[PAGE_SIZE..PAGE_SIZE + TAG_SIZE]
+        let tag: [u8; TAG_SIZE] = cipher_with_tag[PAGE_SIZE..PAGE_SIZE + TAG_SIZE]
             .try_into()
             .map_err(|_| DbError::Corruption("Invalid tag length".into()))?;
 
-        // Ensure physical capacity exists
         while self.inner.page_count() <= tag_pid.0 {
             self.inner.allocate_page()?;
         }
@@ -244,9 +154,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
             self.inner.allocate_page()?;
         }
 
-        // Write data page ciphertext first, followed by tag and nonce metadata
         self.inner.write_page(data_pid, cipher_body)?;
-        self.write_tag_and_nonce(tag_pid, slot, &nonce, &tag)
+
+        let mut tag_page = [0u8; PAGE_SIZE];
+        tag_page[..NONCE_SIZE].copy_from_slice(&nonce);
+        tag_page[NONCE_SIZE..NONCE_SIZE + TAG_SIZE].copy_from_slice(&tag);
+        self.inner.write_page(tag_pid, &tag_page)
     }
 
     fn sync(&self) -> Result<()> {
@@ -254,24 +167,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     fn page_count(&self) -> u64 {
-        let total_physical = self.inner.page_count();
-        if total_physical < 2 {
-            return 0;
-        }
-        if total_physical < 4 {
-            return 1;
-        }
-
-        let regular_physical = total_physical - 4;
-        let full_groups = regular_physical / STRIDE;
-        let rem = regular_physical % STRIDE;
-        let data_in_rem = rem.saturating_sub(1);
-        2 + full_groups * TAGS_PER_PAGE + data_in_rem
+        self.inner.page_count() / 2
     }
 
     fn allocate_page(&mut self) -> Result<PageId> {
         let next_logical = PageId(self.page_count());
-        let (tag_pid, data_pid, _) = logical_to_physical_ids(next_logical);
+        let (tag_pid, data_pid) = logical_to_physical_ids(next_logical);
 
         while self.inner.page_count() <= tag_pid.0 {
             self.inner.allocate_page()?;

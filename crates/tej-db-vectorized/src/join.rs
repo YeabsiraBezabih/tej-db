@@ -105,7 +105,12 @@ impl PhysicalHashJoin {
         if total_rgs == 0 {
             return Ok(0);
         }
-        let rows_per_rg = row_groups[0].metadata.num_rows as usize;
+        let rows_per_rg = row_groups
+            .iter()
+            .map(|rg| rg.metadata.num_rows as usize)
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let scheduler = std::sync::Arc::new(crate::MorselScheduler::new(
             total_rgs,
             rows_per_rg,

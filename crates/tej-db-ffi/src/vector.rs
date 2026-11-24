@@ -31,6 +31,11 @@ pub unsafe extern "C" fn tej_db_vector_insert(
     catch_ffi(|| {
         check_not_null(db, "db")?;
         check_not_null(vec_ptr, "vec_ptr")?;
+        if (vec_ptr as usize) % std::mem::align_of::<f32>() != 0 {
+            return Err(FfiError::InvalidArg(
+                "Pointer vec_ptr is not aligned for f32".into(),
+            ));
+        }
         if dim == 0 {
             return Err(FfiError::InvalidArg("Vector dimension cannot be 0".into()));
         }
@@ -133,6 +138,27 @@ pub unsafe extern "C" fn tej_db_vector_search(
         check_not_null_mut(out_ids, "out_ids")?;
         check_not_null_mut(out_dists, "out_dists")?;
         check_not_null_mut(out_count, "out_count")?;
+
+        if (query_ptr as usize) % std::mem::align_of::<f32>() != 0 {
+            return Err(FfiError::InvalidArg(
+                "Pointer query_ptr is not aligned for f32".into(),
+            ));
+        }
+        if (out_ids as usize) % std::mem::align_of::<u64>() != 0 {
+            return Err(FfiError::InvalidArg(
+                "Pointer out_ids is not aligned for u64".into(),
+            ));
+        }
+        if (out_dists as usize) % std::mem::align_of::<f32>() != 0 {
+            return Err(FfiError::InvalidArg(
+                "Pointer out_dists is not aligned for f32".into(),
+            ));
+        }
+        if (out_count as usize) % std::mem::align_of::<usize>() != 0 {
+            return Err(FfiError::InvalidArg(
+                "Pointer out_count is not aligned for usize".into(),
+            ));
+        }
 
         if dim == 0 || top_k == 0 {
             return Err(FfiError::InvalidArg(

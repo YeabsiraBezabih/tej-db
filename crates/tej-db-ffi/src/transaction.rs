@@ -124,7 +124,9 @@ pub unsafe extern "C" fn tej_db_begin_write(
             DbInstance::Mem { db, .. } => WriteTxInstance::Mem(OwnedWriteTx::new(db.clone())?),
         };
 
-        let tx_handle = Box::into_raw(Box::new(TejWriteTxHandle(write_instance)));
+        let tx_handle = Box::into_raw(Box::new(TejWriteTxHandle(parking_lot::Mutex::new(
+            write_instance,
+        ))));
         // SAFETY: tx_out validated non-null and writable.
         unsafe {
             *tx_out = tx_handle;
@@ -161,9 +163,10 @@ pub unsafe extern "C" fn tej_db_write_tx_put(
         } else {
             unsafe { std::slice::from_raw_parts(val_ptr, val_len) }
         };
-        let handle = unsafe { &mut *tx };
+        let handle = unsafe { &*tx };
+        let mut guard = handle.0.lock();
 
-        match &mut handle.0 {
+        match &mut *guard {
             #[cfg(not(target_arch = "wasm32"))]
             WriteTxInstance::File(owned) => {
                 let write_tx = owned.as_mut()?;
@@ -201,9 +204,10 @@ pub unsafe extern "C" fn tej_db_write_tx_delete(
         // SAFETY: Validated non-null; key pointer valid for key_len bytes.
         let table_str = unsafe { c_str_to_str(table, "table")? };
         let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
-        let handle = unsafe { &mut *tx };
+        let handle = unsafe { &*tx };
+        let mut guard = handle.0.lock();
 
-        match &mut handle.0 {
+        match &mut *guard {
             #[cfg(not(target_arch = "wasm32"))]
             WriteTxInstance::File(owned) => {
                 let write_tx = owned.as_mut()?;
@@ -233,7 +237,8 @@ pub unsafe extern "C" fn tej_db_write_tx_commit(tx: *mut TejWriteTxHandle) -> i3
         check_not_null_mut(tx, "tx")?;
         // SAFETY: Reclaims boxed handle to commit and drop upon completion.
         let boxed = unsafe { Box::from_raw(tx) };
-        match boxed.0 {
+        let instance = boxed.0.into_inner();
+        match instance {
             #[cfg(not(target_arch = "wasm32"))]
             WriteTxInstance::File(owned) => owned.commit()?,
             WriteTxInstance::Mem(owned) => owned.commit()?,
@@ -254,7 +259,8 @@ pub unsafe extern "C" fn tej_db_write_tx_abort(tx: *mut TejWriteTxHandle) -> i32
         check_not_null_mut(tx, "tx")?;
         // SAFETY: Reclaims boxed handle to abort and drop cleanly.
         let boxed = unsafe { Box::from_raw(tx) };
-        match boxed.0 {
+        let instance = boxed.0.into_inner();
+        match instance {
             #[cfg(not(target_arch = "wasm32"))]
             WriteTxInstance::File(owned) => owned.abort(),
             WriteTxInstance::Mem(owned) => owned.abort(),

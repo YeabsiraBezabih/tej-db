@@ -165,6 +165,7 @@ impl<S: Storage> TxManager<S> {
         let final_next = cur_next + approved_records.len() as u64;
 
         // Phase 5: Two-Phase Durability Flush Barrier
+        let mut target_sb_opt = None;
         let durability_res = (|| -> Result<()> {
             match self.durability() {
                 DurabilityMode::Immediate => {
@@ -184,6 +185,7 @@ impl<S: Storage> TxManager<S> {
                 let cur_sb = PageId(self.active_superblock.load(Ordering::Acquire));
                 let target_sb =
                     crate::superblock::choose_commit_superblock(cur_sb, TxId(final_next));
+                target_sb_opt = Some(target_sb);
                 crate::superblock::write_superblock(&self.cache, target_sb, &meta)?;
                 self.cache.flush_page(target_sb)?;
                 if self.durability() == DurabilityMode::Immediate {
@@ -195,6 +197,9 @@ impl<S: Storage> TxManager<S> {
         })();
 
         if let Err(e) = durability_res {
+            if let Some(target_sb) = target_sb_opt {
+                self.cache.discard_page(target_sb);
+            }
             for &pid in &combined_pages.allocated {
                 self.cache.free_page(pid);
             }

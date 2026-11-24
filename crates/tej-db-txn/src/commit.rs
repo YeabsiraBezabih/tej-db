@@ -167,6 +167,7 @@ impl<S: Storage> WriteTx<'_, S> {
         let final_next_tx = next_assign_tx + approved_records.len() as u64;
 
         // Durability Barrier Phase 1 & Phase 2
+        let mut target_sb_opt = None;
         let durability_res = (|| -> Result<()> {
             match self.manager.durability() {
                 DurabilityMode::Immediate => {
@@ -187,6 +188,7 @@ impl<S: Storage> WriteTx<'_, S> {
                 let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
                 let target_sb =
                     crate::superblock::choose_commit_superblock(cur_sb, TxId(final_next_tx));
+                target_sb_opt = Some(target_sb);
                 crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
                 self.manager.cache.flush_page(target_sb)?;
                 if self.manager.durability() == DurabilityMode::Immediate {
@@ -200,6 +202,9 @@ impl<S: Storage> WriteTx<'_, S> {
         })();
 
         if let Err(e) = durability_res {
+            if let Some(target_sb) = target_sb_opt {
+                self.manager.cache.discard_page(target_sb);
+            }
             for &pid in &combined_pages.allocated {
                 self.manager.cache.free_page(pid);
             }

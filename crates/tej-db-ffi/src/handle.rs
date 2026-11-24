@@ -141,7 +141,7 @@ impl std::fmt::Debug for WriteTxInstance {
 
 /// Opaque write transaction handle exposed to C ABI.
 #[derive(Debug)]
-pub struct TejWriteTxHandle(pub(crate) WriteTxInstance);
+pub struct TejWriteTxHandle(pub(crate) parking_lot::Mutex<WriteTxInstance>);
 
 /// Validates that a raw pointer argument is non-null.
 pub fn check_not_null<T>(ptr: *const T, name: &'static str) -> Result<(), FfiError> {

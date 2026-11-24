@@ -167,7 +167,7 @@ impl VamanaGraph {
         // Initialize random R-regular out-edges to form a connected expander graph
         let mut rng_state = 0x853c_49e6_748f_ea9bu64;
         let r_init = r.min(n.saturating_sub(1));
-        for i in 0..n {
+        for (i, adj_slot) in graph.adj.iter_mut().enumerate() {
             let mut adj = SmallVec::with_capacity(r);
             while adj.len() < r_init {
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -178,7 +178,7 @@ impl VamanaGraph {
                     adj.push(u32_target);
                 }
             }
-            graph.adj[i] = adj;
+            *adj_slot = adj;
         }
 
         // Pass 1 (alpha = 1.0): Initial randomized connectivity

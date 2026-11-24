@@ -1,12 +1,11 @@
-use crate::bounds::{max_start_bound, min_end_bound};
+use crate::bounds::{extract_pk_equality, extract_pk_range};
 use crate::plan_ddl::plan_create_table;
 use crate::plan_dml::{map_returning, plan_insert};
 use crate::schema::{SqlType, TableSchema};
 use crate::upsert::{OnConflict, ReturningClause};
-use crate::value::Value;
 use sqlparser::ast::{
-    BinaryOperator, DataType as SqlDataType, Expr as SqlExpr, Query, SelectItem, SetExpr,
-    Statement, TableFactor, Value as SqlValue,
+    DataType as SqlDataType, Expr as SqlExpr, GroupByExpr, Query, SelectItem, SetExpr, Statement,
+    TableFactor, Value as SqlValue,
 };
 use std::ops::Bound;
 use tej_db_core::{DbError, KeyRange, Result};
@@ -158,10 +157,49 @@ impl Planner {
             .from
             .first()
             .ok_or_else(|| DbError::Custom("SELECT query missing FROM clause".into()))?;
+        if !from_table.joins.is_empty() {
+            return Err(DbError::Custom(
+                "JOIN clauses are currently unsupported in SQL engine".into(),
+            ));
+        }
         let table_name = extract_table_name(&from_table.relation)?;
 
         let schema = schema_provider(&table_name)
             .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
+        if query.order_by.is_some() {
+            return Err(DbError::Custom(
+                "ORDER BY is currently unsupported in SQL engine".into(),
+            ));
+        }
+        if query.offset.is_some() {
+            return Err(DbError::Custom(
+                "OFFSET is currently unsupported in SQL engine".into(),
+            ));
+        }
+        match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
+                return Err(DbError::Custom(
+                    "GROUP BY is currently unsupported in SQL engine".into(),
+                ));
+            }
+            GroupByExpr::All(_) => {
+                return Err(DbError::Custom(
+                    "GROUP BY is currently unsupported in SQL engine".into(),
+                ));
+            }
+            GroupByExpr::Expressions(..) => {}
+        }
+        if select.having.is_some() {
+            return Err(DbError::Custom(
+                "HAVING is currently unsupported in SQL engine".into(),
+            ));
+        }
+        if select.distinct.is_some() {
+            return Err(DbError::Custom(
+                "DISTINCT is currently unsupported in SQL engine".into(),
+            ));
+        }
 
         let mut projection = Vec::new();
         for item in select.projection {
@@ -243,143 +281,6 @@ impl Planner {
         }
 
         (KeyRange::all(), Some(expr))
-    }
-}
-
-fn extract_pk_equality(expr: &SqlExpr, pk_col: &str) -> Option<Value> {
-    if let SqlExpr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expr
-    {
-        if let (SqlExpr::Identifier(id), SqlExpr::Value(v)) = (left.as_ref(), right.as_ref()) {
-            if id.value.eq_ignore_ascii_case(pk_col) {
-                let parsed = parse_sql_value(v)?;
-                if parsed.is_null() {
-                    return None;
-                }
-                return Some(parsed);
-            }
-        }
-        if let (SqlExpr::Value(v), SqlExpr::Identifier(id)) = (left.as_ref(), right.as_ref()) {
-            if id.value.eq_ignore_ascii_case(pk_col) {
-                let parsed = parse_sql_value(v)?;
-                if parsed.is_null() {
-                    return None;
-                }
-                return Some(parsed);
-            }
-        }
-    }
-    None
-}
-
-#[allow(clippy::type_complexity, clippy::single_match)]
-fn extract_pk_range(
-    expr: &SqlExpr,
-    pk_col: &str,
-) -> Option<(Bound<Vec<u8>>, Bound<Vec<u8>>, Option<SqlExpr>)> {
-    match expr {
-        SqlExpr::BinaryOp { left, op, right } => {
-            if let (SqlExpr::Identifier(id), SqlExpr::Value(v)) = (left.as_ref(), right.as_ref()) {
-                if id.value.eq_ignore_ascii_case(pk_col) {
-                    let val = parse_sql_value(v)?;
-                    if val.is_null() {
-                        return Some((
-                            Bound::Excluded(Vec::new()),
-                            Bound::Included(Vec::new()),
-                            None,
-                        ));
-                    }
-                    let enc = val.encode_key();
-                    match op {
-                        BinaryOperator::Gt => {
-                            return Some((Bound::Excluded(enc), Bound::Unbounded, None));
-                        }
-                        BinaryOperator::GtEq => {
-                            return Some((Bound::Included(enc), Bound::Unbounded, None));
-                        }
-                        BinaryOperator::Lt => {
-                            return Some((Bound::Unbounded, Bound::Excluded(enc), None));
-                        }
-                        BinaryOperator::LtEq => {
-                            return Some((Bound::Unbounded, Bound::Included(enc), None));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let (SqlExpr::Value(v), SqlExpr::Identifier(id)) = (left.as_ref(), right.as_ref()) {
-                if id.value.eq_ignore_ascii_case(pk_col) {
-                    let val = parse_sql_value(v)?;
-                    if val.is_null() {
-                        return Some((
-                            Bound::Excluded(Vec::new()),
-                            Bound::Included(Vec::new()),
-                            None,
-                        ));
-                    }
-                    let enc = val.encode_key();
-                    match op {
-                        BinaryOperator::Gt => {
-                            // v > id  <=>  id < v
-                            return Some((Bound::Unbounded, Bound::Excluded(enc), None));
-                        }
-                        BinaryOperator::GtEq => {
-                            // v >= id  <=>  id <= v
-                            return Some((Bound::Unbounded, Bound::Included(enc), None));
-                        }
-                        BinaryOperator::Lt => {
-                            // v < id  <=>  id > v
-                            return Some((Bound::Excluded(enc), Bound::Unbounded, None));
-                        }
-                        BinaryOperator::LtEq => {
-                            // v <= id  <=>  id >= v
-                            return Some((Bound::Included(enc), Bound::Unbounded, None));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let SqlExpr::BinaryOp {
-                left: l_box,
-                op: BinaryOperator::And,
-                right: r_box,
-            } = expr
-            {
-                if let (Some((s1, e1, None)), Some((s2, e2, None))) = (
-                    extract_pk_range(l_box, pk_col),
-                    extract_pk_range(r_box, pk_col),
-                ) {
-                    let start = max_start_bound(s1, s2);
-                    let end = min_end_bound(e1, e2);
-                    return Some((start, end, None));
-                }
-            }
-        }
-        _ => {}
-    }
-    None
-}
-
-fn parse_sql_value(val: &SqlValue) -> Option<Value> {
-    match val {
-        SqlValue::Number(n, _) => {
-            if let Ok(i) = n.parse::<i64>() {
-                Some(Value::Integer(i))
-            } else if let Ok(f) = n.parse::<f64>() {
-                Some(Value::Real(f))
-            } else {
-                None
-            }
-        }
-        SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
-            Some(Value::Text(s.clone()))
-        }
-        SqlValue::Boolean(b) => Some(Value::Boolean(*b)),
-        SqlValue::Null => Some(Value::Null),
-        _ => None,
     }
 }
 

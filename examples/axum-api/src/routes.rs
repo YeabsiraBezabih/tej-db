@@ -334,6 +334,18 @@ pub async fn get_stats(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
+#[inline]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Route 6: POST /api/sql (Execute arbitrary SQL queries against the DBMS engine)
 pub async fn execute_sql(
     State(state): State<AppState>,
@@ -342,16 +354,17 @@ pub async fn execute_sql(
 ) -> impl IntoResponse {
     if let Ok(expected_key) = std::env::var("TEJ_API_KEY") {
         if !expected_key.is_empty() {
+            let exp_bytes = expected_key.as_bytes();
             let auth_ok = headers
                 .get("x-api-key")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|k| k == expected_key)
+                .is_some_and(|k| constant_time_eq(k.as_bytes(), exp_bytes))
                 || headers
                     .get("authorization")
                     .and_then(|v| v.to_str().ok())
                     .is_some_and(|h| {
                         h.strip_prefix("Bearer ")
-                            .is_some_and(|tok| tok == expected_key)
+                            .is_some_and(|tok| constant_time_eq(tok.as_bytes(), exp_bytes))
                     });
             if !auth_ok {
                 return (
@@ -360,6 +373,13 @@ pub async fn execute_sql(
                 );
             }
         }
+    }
+
+    if payload.sql.len() > 65_536 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::err("SQL query exceeds 64KB length limit")),
+        );
     }
 
     let sql_engine = Arc::clone(&state.sql);

@@ -77,18 +77,23 @@ impl Storage for FileStorage {
     fn read_overflow_payload(
         &self,
         start_id: PageId,
-        _total_len: usize,
+        total_len: usize,
         out: &mut [u8],
     ) -> Result<bool> {
         if start_id.0 >= self.page_count {
             return Ok(false);
         }
+        if out.len() < total_len {
+            return Err(DbError::Custom(
+                "Output buffer smaller than total_len".into(),
+            ));
+        }
         let offset = start_id.0 * PAGE_SIZE as u64;
         let file_bytes = self.page_count * PAGE_SIZE as u64;
-        if offset + out.len() as u64 > file_bytes {
+        if offset + total_len as u64 > file_bytes {
             return Ok(false);
         }
-        self.file.read_exact_at(out, offset)?;
+        self.file.read_exact_at(&mut out[..total_len], offset)?;
         Ok(true)
     }
 
@@ -195,6 +200,8 @@ impl Storage for FileStorage {
     fn allocate_pages(&mut self, count: usize) -> Result<Vec<PageId>> {
         let start = self.page_count;
         self.page_count += count as u64;
+        let new_len = self.page_count * PAGE_SIZE as u64;
+        self.file.set_len(new_len).map_err(DbError::Io)?;
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
             ids.push(PageId(start + i as u64));
@@ -205,6 +212,8 @@ impl Storage for FileStorage {
     fn allocate_contiguous_extent(&mut self, count: usize) -> Result<PageId> {
         let start = self.page_count;
         self.page_count += count as u64;
+        let new_len = self.page_count * PAGE_SIZE as u64;
+        self.file.set_len(new_len).map_err(DbError::Io)?;
         Ok(PageId(start))
     }
 }

@@ -23,6 +23,7 @@ pub struct PageCache<S: Storage> {
     active_shards: usize,
     pub(crate) shards: [CacheShard; CACHE_SHARDS],
     pub(crate) dirty_shard_mask: AtomicU16,
+    pub(crate) flush_lock: Mutex<()>,
     pub(crate) free_list: Mutex<Vec<PageId>>,
     pub(crate) preallocated_pages: Mutex<Vec<PageId>>,
     pub(crate) pending_free: Mutex<Vec<PageId>>,
@@ -87,6 +88,7 @@ impl<S: Storage> PageCache<S> {
             active_shards,
             shards,
             dirty_shard_mask: AtomicU16::new(0),
+            flush_lock: Mutex::new(()),
             free_list: Mutex::new(Vec::new()),
             preallocated_pages: Mutex::new(Vec::new()),
             pending_free: Mutex::new(Vec::new()),
@@ -354,5 +356,20 @@ impl<S: Storage> PageCache<S> {
         }
 
         Ok(())
+    }
+
+    /// Discard a single cached page completely from memory (e.g. on failed commit or rollback).
+    pub fn discard_page(&self, id: PageId) {
+        let s_idx = self.shard_index(id);
+        let mut state = self.shards[s_idx].state.write();
+        let CacheShardState {
+            entries,
+            clock_ring,
+            dirty_pages,
+            ..
+        } = &mut *state;
+        entries.remove(&id);
+        dirty_pages.retain(|&pid| pid != id);
+        clock_ring.retain(|&pid| pid != id);
     }
 }

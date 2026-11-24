@@ -119,9 +119,9 @@ impl Database<FileStorage> {
 
     /// Export an online, crash-safe, non-blocking snapshot backup to `dest_path`.
     ///
-    /// Streams key-value records directly from snapshot pages without loading
-    /// the full database into intermediate heap memory. Safely backs up the default
-    /// table as well as all named tables, secondary indexes, sharded partitions, and catalogs.
+    /// Copies all physical pages directly from the flushed snapshot state.
+    /// Safely backs up the default table as well as all named tables, secondary indexes,
+    /// sharded partitions, catalogs, raw VectorNode pages, and spatial MeshletNode pages.
     pub fn backup(&self, dest_path: impl AsRef<Path>) -> Result<()> {
         let dest_p = dest_path.as_ref();
         let src_p = self.cache.storage().read().path().to_path_buf();
@@ -137,38 +137,38 @@ impl Database<FileStorage> {
             ));
         }
 
-        let rx = self.begin_read()?;
-        let dest_db = Database::open_file(dest_p)?;
-        let mut dest_tx = dest_db.begin_write()?;
+        // 1. Serialize backup under commit_lock to ensure point-in-time ACID crash consistency
+        let _commit_guard = self.tx_manager.commit_lock().lock();
 
-        // 1. Stream copy default table
-        let range = KeyRange::all();
-        rx.scan_range_visitor(&range, |key, value| {
-            dest_tx.put(key, value)?;
-            Ok(true)
-        })?;
+        // 2. Flush and sync all pending dirty pages to disk so storage is 100% up to date
+        self.cache.flush()?;
+        self.cache.sync()?;
 
-        // 2. Stream copy all tracked physical tables (named, partitioned, and catalog tables)
-        for tbl_name in rx.physical_tables() {
-            if tbl_name == "default" {
-                continue;
-            }
-            dest_tx.create_table(&tbl_name)?;
-            let tbl = rx.open_table(&tbl_name)?;
-            tbl.scan_range_visitor(&range, |key, value| {
-                dest_tx.put_table_key(&tbl_name, key, value)?;
-                Ok(true)
-            })?;
+        // 3. Copy physical pages directly to destination file storage
+        // This preserves all tables, catalog metadata, VectorNode pages, and MeshletNode pages
+        // with exact PageId references intact.
+        let src_storage = self.cache.storage().read();
+        let count = src_storage.page_count();
+        let mut dest_storage = FileStorage::open(dest_p)?;
+        let mut buf = [0u8; PAGE_SIZE];
+        for i in 0..count {
+            let pid = PageId(i);
+            src_storage.read_page(pid, &mut buf)?;
+            dest_storage.write_page(pid, &buf)?;
         }
-
-        dest_tx.commit()?;
-        dest_db.sync()?;
+        dest_storage.sync()?;
         Ok(())
     }
 
     /// Compact all active database pages into a new database file, removing free-list holes.
     pub fn compact(&self, dest_path: impl AsRef<Path>) -> Result<()> {
         self.backup(dest_path)
+    }
+
+    /// Explicitly close and flush all dirty pages down to storage and issue a hardware sync.
+    pub fn close(self) -> Result<()> {
+        self.cache.flush()?;
+        self.cache.sync()
     }
 }
 

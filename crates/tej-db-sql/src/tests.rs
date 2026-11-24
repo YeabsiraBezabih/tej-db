@@ -425,3 +425,40 @@ fn test_sql_overflow_and_security_panics() {
     assert!(check_schema.is_some(), "Schema must remain intact");
     assert_eq!(check_schema.unwrap().name, "num_test");
 }
+
+#[test]
+fn test_sql_negative_pk_bounds_and_rejected_clauses() {
+    let db = Database::open_memory().unwrap();
+    let sql = SqlEngine::new(&db);
+
+    sql.execute("CREATE TABLE signed_pk (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
+    sql.execute(
+        "INSERT INTO signed_pk VALUES (-10, 'neg_ten'), (-5, 'neg_five'), (0, 'zero'), (5, 'five')",
+    )
+    .unwrap();
+
+    // 1. Negative PK point lookup
+    let res_eq = sql
+        .execute("SELECT val FROM signed_pk WHERE id = -5")
+        .unwrap();
+    assert_eq!(res_eq.rows.len(), 1);
+    assert_eq!(res_eq.rows[0][0], Value::Text("neg_five".into()));
+
+    // 2. Negative PK range scan
+    let res_range = sql
+        .execute("SELECT val FROM signed_pk WHERE id >= -5 AND id <= 0")
+        .unwrap();
+    assert_eq!(res_range.rows.len(), 2);
+    assert_eq!(res_range.rows[0][0], Value::Text("neg_five".into()));
+    assert_eq!(res_range.rows[1][0], Value::Text("zero".into()));
+
+    // 3. Rejected unsupported clauses
+    assert!(sql.execute("SELECT * FROM signed_pk ORDER BY id").is_err());
+    assert!(
+        sql.execute("SELECT * FROM signed_pk LIMIT 10 OFFSET 2")
+            .is_err()
+    );
+    assert!(sql.execute("SELECT id FROM signed_pk GROUP BY id").is_err());
+    assert!(sql.execute("SELECT DISTINCT id FROM signed_pk").is_err());
+}

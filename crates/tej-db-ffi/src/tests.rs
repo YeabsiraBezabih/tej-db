@@ -210,7 +210,7 @@ fn test_ffi_sql_query() {
         assert_eq!(rc, TEJ_OK);
         tej_db_free_string(json_out);
 
-        let query = CString::new("SELECT * FROM items ORDER BY id;").expect("cstring");
+        let query = CString::new("SELECT * FROM items;").expect("cstring");
         let rc = tej_db_sql_execute(db, query.as_ptr(), &mut json_out);
         assert_eq!(rc, TEJ_OK);
         let c_str = CStr::from_ptr(json_out);

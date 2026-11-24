@@ -148,7 +148,13 @@ impl<S: Storage> TxManager<S> {
 
         let root_id = PageId(self.active_root.load(Ordering::Acquire));
         let tx_id = TxId(self.next_tx_id.load(Ordering::Acquire));
-        let btree = BTreeIndex::new(Arc::clone(&self.cache), Some(root_id))?;
+        let btree = match BTreeIndex::new(Arc::clone(&self.cache), Some(root_id)) {
+            Ok(bt) => bt,
+            Err(e) => {
+                self.cache.release_reader();
+                return Err(e);
+            }
+        };
         let catalog_snapshot = self.catalog.snapshot();
 
         Ok(ReadOnlyTx::new(
@@ -249,10 +255,18 @@ impl<S: Storage> TxManager<S> {
     pub fn active_root(&self) -> PageId {
         PageId(self.active_root.load(Ordering::Acquire))
     }
+
+    #[must_use]
+    pub fn commit_lock(&self) -> &AdaptiveSpinLock {
+        &self.commit_lock
+    }
 }
 
 impl<S: Storage> Drop for TxManager<S> {
     fn drop(&mut self) {
         self.stop_flusher_thread();
+        if self.durability() != DurabilityMode::None {
+            let _ = self.cache.flush();
+        }
     }
 }

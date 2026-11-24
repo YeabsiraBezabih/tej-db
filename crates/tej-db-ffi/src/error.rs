@@ -125,12 +125,15 @@ pub unsafe extern "C" fn tej_db_last_error(buf: *mut c_char, max_len: usize) -> 
 
     LAST_ERROR.with(|err| {
         let msg = err.borrow();
-        let bytes = msg.as_deref().unwrap_or("").as_bytes();
-        let copy_len = bytes.len().min(max_len.saturating_sub(1));
+        let s = msg.as_deref().unwrap_or("");
+        let mut copy_len = s.len().min(max_len.saturating_sub(1));
+        while copy_len > 0 && !s.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
 
         // SAFETY: Caller guarantees buf is valid for writes up to max_len.
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), buf, copy_len);
+            std::ptr::copy_nonoverlapping(s.as_bytes().as_ptr().cast::<c_char>(), buf, copy_len);
             *buf.add(copy_len) = 0;
         }
         i32::try_from(copy_len).unwrap_or(0)

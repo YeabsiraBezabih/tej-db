@@ -219,7 +219,7 @@ impl<S: Storage> VectorIndex<S> {
                                 tej_db_vector::simd::cosine_distance(query, &v)
                             }
                             DistanceMetric::DotProduct => {
-                                tej_db_vector::simd::dot_product(query, &v)
+                                -tej_db_vector::simd::dot_product(query, &v)
                             }
                         };
                         candidate_map.insert(

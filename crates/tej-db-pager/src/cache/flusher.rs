@@ -4,6 +4,7 @@ use tej_db_core::{PAGE_SIZE, Page, PageId, Result, Storage};
 
 impl<S: Storage> PageCache<S> {
     pub fn flush_to_storage(&self) -> Result<()> {
+        let _flush_guard = self.flush_lock.lock();
         let mask = self.dirty_shard_mask.swap(0, Ordering::AcqRel);
         if mask == 0 {
             return Ok(());
@@ -102,6 +103,7 @@ impl<S: Storage> PageCache<S> {
     /// Flush only data pages (PageId >= 2) to storage, leaving superblock pages intact.
     /// This establishes Phase 1 of the two-phase commit flush barrier.
     pub fn flush_data_pages(&self) -> Result<()> {
+        let _flush_guard = self.flush_lock.lock();
         let mask = self.dirty_shard_mask.load(Ordering::Acquire);
         if mask == 0 {
             return Ok(());
@@ -195,6 +197,7 @@ impl<S: Storage> PageCache<S> {
     /// Flush a single page (e.g. active superblock) directly to storage.
     /// This establishes Phase 2 of the two-phase commit flush barrier.
     pub fn flush_page(&self, id: PageId) -> Result<()> {
+        let _flush_guard = self.flush_lock.lock();
         let shard_idx = self.shard_index(id);
         let shard = &self.shards[shard_idx];
         let mut state = shard.state.write();

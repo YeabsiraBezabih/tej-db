@@ -189,42 +189,27 @@ pub fn parallel_hash_aggregate(
                             let vals = val_buf.as_slice();
 
                             let len = keys.len().min(vals.len());
-                            let mut i = 0;
-                            while i + 4 <= len {
+                            for i in 0..len {
+                                let key = keys[i];
+                                let val = vals[i];
                                 #[allow(clippy::cast_sign_loss)]
-                                let k0 = keys[i] as usize;
-                                if k0 < DENSE_CAP {
-                                    fast_slots[k0].0 += 1;
-                                    fast_slots[k0].1 += vals[i];
+                                if key >= 0 && (key as usize) < DENSE_CAP {
+                                    fast_slots[key as usize].0 += 1;
+                                    fast_slots[key as usize].1 += val;
+                                } else {
+                                    let entry = local_groups.entry(key).or_insert_with(|| {
+                                        smallvec::smallvec![
+                                            ThreadAggState::Count(0),
+                                            ThreadAggState::SumInt64(0)
+                                        ]
+                                    });
+                                    if let ThreadAggState::Count(ref mut c) = entry[0] {
+                                        *c += 1;
+                                    }
+                                    if let ThreadAggState::SumInt64(ref mut s) = entry[1] {
+                                        *s += val;
+                                    }
                                 }
-                                #[allow(clippy::cast_sign_loss)]
-                                let k1 = keys[i + 1] as usize;
-                                if k1 < DENSE_CAP {
-                                    fast_slots[k1].0 += 1;
-                                    fast_slots[k1].1 += vals[i + 1];
-                                }
-                                #[allow(clippy::cast_sign_loss)]
-                                let k2 = keys[i + 2] as usize;
-                                if k2 < DENSE_CAP {
-                                    fast_slots[k2].0 += 1;
-                                    fast_slots[k2].1 += vals[i + 2];
-                                }
-                                #[allow(clippy::cast_sign_loss)]
-                                let k3 = keys[i + 3] as usize;
-                                if k3 < DENSE_CAP {
-                                    fast_slots[k3].0 += 1;
-                                    fast_slots[k3].1 += vals[i + 3];
-                                }
-                                i += 4;
-                            }
-                            while i < len {
-                                #[allow(clippy::cast_sign_loss)]
-                                let k = keys[i] as usize;
-                                if k < DENSE_CAP {
-                                    fast_slots[k].0 += 1;
-                                    fast_slots[k].1 += vals[i];
-                                }
-                                i += 1;
                             }
                         } else {
                             let chunk = rg.decompress_to_chunk()?;
@@ -264,13 +249,19 @@ pub fn parallel_hash_aggregate(
                         for (k_idx, slot) in fast_slots.iter().enumerate() {
                             if slot.0 > 0 {
                                 #[allow(clippy::cast_possible_wrap)]
-                                local_groups.insert(
-                                    k_idx as i64,
+                                let key = k_idx as i64;
+                                let entry = local_groups.entry(key).or_insert_with(|| {
                                     smallvec::smallvec![
-                                        ThreadAggState::Count(slot.0),
-                                        ThreadAggState::SumInt64(slot.1),
-                                    ],
-                                );
+                                        ThreadAggState::Count(0),
+                                        ThreadAggState::SumInt64(0)
+                                    ]
+                                });
+                                if let ThreadAggState::Count(ref mut c) = entry[0] {
+                                    *c += slot.0;
+                                }
+                                if let ThreadAggState::SumInt64(ref mut s) = entry[1] {
+                                    *s += slot.1;
+                                }
                             }
                         }
                     }

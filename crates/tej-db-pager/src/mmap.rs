@@ -26,11 +26,19 @@ impl MmapStorage {
             .truncate(false)
             .open(path)?;
 
+        crate::lock::FileLock::try_lock_exclusive(&file)?;
+
         let metadata = file.metadata()?;
-        let file_len = metadata.len();
+        let mut file_len = metadata.len();
+        if file_len > 0 && file_len % PAGE_SIZE as u64 != 0 {
+            return Err(DbError::Corruption(format!(
+                "Memory-mapped file length ({file_len} bytes) is not a multiple of PAGE_SIZE ({PAGE_SIZE} bytes)"
+            )));
+        }
         if file_len == 0 {
             let init = (PAGE_SIZE as u64) * 4;
             file.set_len(init)?;
+            file_len = init;
         }
 
         // SAFETY: We own the file descriptor exclusively and configure MmapMut over a validated file length.
@@ -64,12 +72,21 @@ impl MmapStorage {
         }
         Ok(())
     }
+    fn page_offset(id: PageId) -> Result<usize> {
+        usize::try_from(id.0)
+            .ok()
+            .and_then(|i| i.checked_mul(PAGE_SIZE))
+            .ok_or_else(|| DbError::CapacityExceeded("PageId offset overflow".into()))
+    }
 }
 
 #[cfg(feature = "mmap")]
 impl Storage for MmapStorage {
     fn read_page(&self, id: PageId, buf: &mut [u8]) -> Result<()> {
-        let offset = (id.0 as usize) * PAGE_SIZE;
+        if buf.len() != PAGE_SIZE {
+            return Err(DbError::Custom("Buffer size must equal PAGE_SIZE".into()));
+        }
+        let offset = Self::page_offset(id)?;
         let mmap_guard = self.mmap.read();
 
         if offset + PAGE_SIZE > mmap_guard.len() {
@@ -81,7 +98,12 @@ impl Storage for MmapStorage {
     }
 
     fn read_pages(&self, start_id: PageId, pages: &mut [u8]) -> Result<()> {
-        let offset = (start_id.0 as usize) * PAGE_SIZE;
+        if pages.len() % PAGE_SIZE != 0 {
+            return Err(DbError::Custom(
+                "Buffer size must be a multiple of PAGE_SIZE".into(),
+            ));
+        }
+        let offset = Self::page_offset(start_id)?;
         let mmap_guard = self.mmap.read();
 
         if offset + pages.len() > mmap_guard.len() {
@@ -98,7 +120,7 @@ impl Storage for MmapStorage {
         total_len: usize,
         out: &mut [u8],
     ) -> Result<bool> {
-        let offset = (start_id.0 as usize) * PAGE_SIZE;
+        let offset = Self::page_offset(start_id)?;
         let mmap_guard = self.mmap.read();
 
         if offset + total_len > mmap_guard.len() {
@@ -115,7 +137,7 @@ impl Storage for MmapStorage {
         total_len: usize,
         f: impl FnOnce(&[u8]) -> Result<R>,
     ) -> Result<Option<R>> {
-        let offset = (start_id.0 as usize) * PAGE_SIZE;
+        let offset = Self::page_offset(start_id)?;
         let mmap_guard = self.mmap.read();
 
         if offset + total_len > mmap_guard.len() {
@@ -128,21 +150,32 @@ impl Storage for MmapStorage {
     }
 
     fn write_page(&mut self, id: PageId, buf: &[u8]) -> Result<()> {
+        if buf.len() != PAGE_SIZE {
+            return Err(DbError::Custom("Buffer size must equal PAGE_SIZE".into()));
+        }
         self.ensure_capacity(id.0 + 1)?;
-        let offset = (id.0 as usize) * PAGE_SIZE;
+        let offset = Self::page_offset(id)?;
         let mut mmap_guard = self.mmap.write();
 
         mmap_guard[offset..offset + PAGE_SIZE].copy_from_slice(buf);
+        self.page_count.fetch_max(id.0 + 1, Ordering::Release);
         Ok(())
     }
 
     fn write_pages(&mut self, start_id: PageId, pages: &[u8]) -> Result<()> {
+        if pages.len() % PAGE_SIZE != 0 {
+            return Err(DbError::Custom(
+                "Buffer size must be a multiple of PAGE_SIZE".into(),
+            ));
+        }
         let count = pages.len() / PAGE_SIZE;
         self.ensure_capacity(start_id.0 + count as u64)?;
 
-        let offset = (start_id.0 as usize) * PAGE_SIZE;
+        let offset = Self::page_offset(start_id)?;
         let mut mmap_guard = self.mmap.write();
         mmap_guard[offset..offset + pages.len()].copy_from_slice(pages);
+        self.page_count
+            .fetch_max(start_id.0 + count as u64, Ordering::Release);
         Ok(())
     }
 
@@ -154,9 +187,15 @@ impl Storage for MmapStorage {
         };
         self.ensure_capacity(start_id.0 + num_pages as u64)?;
 
-        let offset = (start_id.0 as usize) * PAGE_SIZE;
+        let offset = Self::page_offset(start_id)?;
+        let target_len = num_pages * PAGE_SIZE;
         let mut mmap_guard = self.mmap.write();
         mmap_guard[offset..offset + data.len()].copy_from_slice(data);
+        if data.len() < target_len {
+            mmap_guard[offset + data.len()..offset + target_len].fill(0);
+        }
+        self.page_count
+            .fetch_max(start_id.0 + num_pages as u64, Ordering::Release);
         Ok(())
     }
 

@@ -58,6 +58,28 @@ impl<S: Storage> BTreeIndex<S> {
         }
     }
 
+    /// Retire or free overflow extent pages depending on whether they were created in the current transaction.
+    pub fn retire_overflow_extent(
+        &self,
+        first_id: PageId,
+        total_len: u64,
+        tx_pages: &mut TxPageSet,
+    ) {
+        if !first_id.is_valid() {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let num_pages = (total_len as usize).div_ceil(tej_db_core::PAGE_SIZE);
+        for i in 0..num_pages {
+            let pid = PageId(first_id.0 + i as u64);
+            if tx_pages.contains(&pid) {
+                self.cache.free_page(pid);
+            } else {
+                tx_pages.retire(pid);
+            }
+        }
+    }
+
     /// Free all pages belonging to a legacy linked overflow page chain.
     pub fn free_overflow_chain(&self, mut curr_id: PageId) -> Result<()> {
         while curr_id.is_valid() {

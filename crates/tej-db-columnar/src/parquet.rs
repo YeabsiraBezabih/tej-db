@@ -148,7 +148,18 @@ impl ParquetReader {
             return Err(DbError::Custom("Invalid Parquet footer magic".into()));
         }
 
+        if batch_size == 0 {
+            return Err(DbError::Custom(
+                "batch_size must be greater than zero".into(),
+            ));
+        }
+
         let meta_len = u64::from(u32::from_le_bytes(len_bytes));
+        if file_len < 8 || file_len - 8 < meta_len {
+            return Err(DbError::Corruption(format!(
+                "Invalid Parquet file length {file_len}: cannot contain 8-byte footer + metadata of length {meta_len}"
+            )));
+        }
         let meta_start = file_len - 8 - meta_len;
         file.seek(SeekFrom::Start(meta_start))
             .map_err(DbError::Io)?;
@@ -163,11 +174,24 @@ impl ParquetReader {
         let num_rows = metadata.num_rows;
         let num_cols = metadata.physical_types.len();
 
+        if metadata.column_chunk_offsets.len() < num_cols
+            || metadata.column_chunk_lengths.len() < num_cols
+        {
+            return Err(DbError::Corruption(
+                "Mismatched column chunk metadata in Parquet footer".into(),
+            ));
+        }
+
         // Read all raw column bytes
         let mut all_column_data = Vec::with_capacity(num_cols);
         for col_idx in 0..num_cols {
             let offset = metadata.column_chunk_offsets[col_idx];
             let length = metadata.column_chunk_lengths[col_idx] as usize;
+            if offset + (length as u64) > file_len {
+                return Err(DbError::Corruption(
+                    "Column chunk offset extends past end of file".into(),
+                ));
+            }
             file.seek(SeekFrom::Start(offset)).map_err(DbError::Io)?;
             let mut raw_data = vec![0u8; length];
             file.read_exact(&mut raw_data).map_err(DbError::Io)?;

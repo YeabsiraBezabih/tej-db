@@ -85,3 +85,32 @@ fn test_dictionary_roundtrip() {
     let decompressed_refs: Vec<&str> = decompressed.iter().map(String::as_str).collect();
     assert_eq!(decompressed_refs, items);
 }
+
+#[test]
+fn test_bitpacking_extreme_i64_min_max() {
+    let original = vec![i64::MIN, 0, i64::MAX, -1, 1, i64::MIN + 1, i64::MAX - 1];
+    let compressed = BitPackingCodec::encode(&original);
+    let decompressed = BitPackingCodec::decode(&compressed).unwrap();
+    assert_eq!(decompressed, original);
+}
+
+#[test]
+fn test_codecs_malicious_header_rejection() {
+    // 1. Bitpack with huge count (1_000_000_000) but only 13 bytes
+    let mut bad_bitpack = vec![0; 13];
+    bad_bitpack[0..4].copy_from_slice(&(1_000_000_000u32).to_le_bytes());
+    bad_bitpack[12] = 8; // 8 bits per item
+    assert!(BitPackingCodec::decode(&bad_bitpack).is_err());
+
+    // 2. RLE with huge run_len exceeding total_count
+    let mut bad_rle = vec![0; 16];
+    bad_rle[0..4].copy_from_slice(&(10u32).to_le_bytes()); // total_count = 10
+    bad_rle[4..8].copy_from_slice(&(1_000_000u32).to_le_bytes()); // run_len = 1,000,000
+    assert!(RleCodec::decode(&bad_rle).is_err());
+
+    // 3. Dictionary with huge dict_size (0xFFFF_FFFF) on small byte buffer
+    let mut bad_dict = vec![0; 12];
+    bad_dict[0..4].copy_from_slice(&(10u32).to_le_bytes());
+    bad_dict[4..8].copy_from_slice(&(u32::MAX).to_le_bytes());
+    assert!(DictionaryCodec::decode(&bad_dict).is_err());
+}

@@ -10,8 +10,8 @@ pub mod types;
 
 pub use error::{DbError, Result};
 pub use page::{
-    MAX_INLINE_VAL_SIZE, OVERFLOW_FLAG, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE, Page, PageHeader,
-    PageType,
+    MAX_INLINE_VAL_SIZE, MAX_KEY_SIZE, OVERFLOW_FLAG, PAGE_HEADER_SIZE, PAGE_MAGIC, PAGE_SIZE,
+    Page, PageHeader, PageType,
 };
 pub use spatial::{
     Aabb3D, BoundingSphere, GAUSSIAN_SPLAT_HEADER_SIZE, GAUSSIAN_SPLAT_MAGIC,

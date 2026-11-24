@@ -34,27 +34,36 @@ pub enum CompiledStatement {
 }
 
 /// A prepared, compiled SQL statement ready for parameter execution.
-pub struct PreparedStatement<'a, S: Storage> {
-    pub(crate) engine: &'a SqlEngine<'a, S>,
+pub struct PreparedStatement<S: Storage> {
+    pub(crate) engine: SqlEngine<S>,
     pub(crate) compiled: CompiledStatement,
 }
 
-impl<S: Storage> fmt::Debug for PreparedStatement<'_, S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PreparedStatement")
-            .field("compiled", &self.compiled)
-            .finish()
+impl<S: Storage> Clone for PreparedStatement<S> {
+    fn clone(&self) -> Self {
+        Self {
+            engine: self.engine.clone(),
+            compiled: self.compiled.clone(),
+        }
     }
 }
 
-impl<'a, S: Storage> PreparedStatement<'a, S> {
+impl<S: Storage> fmt::Debug for PreparedStatement<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreparedStatement")
+            .field("compiled", &self.compiled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: Storage> PreparedStatement<S> {
     #[must_use]
-    pub fn new(engine: &'a SqlEngine<'a, S>, compiled: CompiledStatement) -> Self {
+    pub fn new(engine: SqlEngine<S>, compiled: CompiledStatement) -> Self {
         Self { engine, compiled }
     }
 }
 
-impl<S: Storage> PreparedStatement<'_, S> {
+impl<S: Storage> PreparedStatement<S> {
     /// Execute prepared statement inside an existing active write transaction without committing.
     pub fn execute_in_tx(&self, tx: &mut WriteTx<'_, S>, params: &[Value]) -> Result<QueryResult> {
         match &self.compiled {
@@ -62,8 +71,13 @@ impl<S: Storage> PreparedStatement<'_, S> {
                 thread_local! {
                     static ROW_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                 }
+                crate::constraint_eval::validate_check_constraints(schema, params)?;
                 let mut tbl = tx.open_table_mut(table_name)?;
-                schema.with_row_key(params, 0, |key_bytes| -> Result<()> {
+                let rowid = self
+                    .engine
+                    .auto_rowid
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                schema.with_row_key(params, rowid, |key_bytes| -> Result<()> {
                     ROW_BUF.with(|cell| -> Result<()> {
                         let mut val_buf = cell.borrow_mut();
                         schema.encode_row_value_into(params, &mut val_buf)?;
@@ -92,7 +106,22 @@ impl<S: Storage> PreparedStatement<'_, S> {
                     let mut row = schema.decode_row_value(&val_bytes)?;
                     if *col_idx < row.len() {
                         row[*col_idx] = new_val.clone();
+                        crate::constraint_eval::validate_check_constraints(schema, &row)?;
                         let updated_bytes = schema.encode_row_value(&row)?;
+                        let is_pk_col = schema.pk_indices.contains(col_idx);
+                        if is_pk_col {
+                            let new_key = schema.encode_row_key(&row, 0);
+                            if new_key != key_bytes {
+                                if tbl.get(&new_key)?.is_some() {
+                                    return Err(DbError::Custom(
+                                        "Primary key uniqueness violation".into(),
+                                    ));
+                                }
+                                tbl.delete(&key_bytes)?;
+                                tbl.put(&new_key, &updated_bytes)?;
+                                return Ok(QueryResult::affected(1));
+                            }
+                        }
                         tbl.put(&key_bytes, &updated_bytes)?;
                         return Ok(QueryResult::affected(1));
                     }
@@ -130,7 +159,11 @@ impl<S: Storage> PreparedStatement<'_, S> {
                 Ok(found
                     .unwrap_or_else(|| QueryResult::rows(result_column_names.clone(), Vec::new())))
             }
-            CompiledStatement::General { plan } => self.engine.execute_plan_in_tx(tx, plan),
+            CompiledStatement::General { plan } => {
+                let mut substituted = *plan.clone();
+                crate::param_subst::substitute_plan_params(&mut substituted, params)?;
+                self.engine.execute_plan_in_tx(tx, &substituted)
+            }
         }
     }
 
@@ -160,29 +193,34 @@ impl<S: Storage> PreparedStatement<'_, S> {
         rx: &tej_db::ReadOnlyTx<S>,
         params: &[Value],
     ) -> Result<QueryResult> {
-        if let CompiledStatement::PointQuery {
-            table_name,
-            schema,
-            projected_col_indices,
-            result_column_names,
-            pk_param_idx,
-            ..
-        } = &self.compiled
-        {
-            let pk_val = params
-                .get(*pk_param_idx)
-                .ok_or_else(|| DbError::Custom("Missing primary key parameter".into()))?;
-
-            let tbl = rx.open_table(table_name)?;
-            Self::execute_point_lookup(
+        match &self.compiled {
+            CompiledStatement::PointQuery {
+                table_name,
                 schema,
                 projected_col_indices,
                 result_column_names,
-                &tbl,
-                pk_val,
-            )
-        } else {
-            Err(DbError::Custom("Statement is not a query".into()))
+                pk_param_idx,
+                ..
+            } => {
+                let pk_val = params
+                    .get(*pk_param_idx)
+                    .ok_or_else(|| DbError::Custom("Missing primary key parameter".into()))?;
+
+                let tbl = rx.open_table(table_name)?;
+                Self::execute_point_lookup(
+                    schema,
+                    projected_col_indices,
+                    result_column_names,
+                    &tbl,
+                    pk_val,
+                )
+            }
+            CompiledStatement::General { plan } if matches!(&**plan, Plan::Select { .. }) => {
+                let mut substituted = *plan.clone();
+                crate::param_subst::substitute_plan_params(&mut substituted, params)?;
+                self.engine.execute_select_on_rx(rx, &substituted)
+            }
+            _ => Err(DbError::Custom("Statement is not a query".into())),
         }
     }
 
@@ -267,7 +305,12 @@ impl<S: Storage> PreparedStatement<'_, S> {
     ) -> Result<QueryResult> {
         match &self.compiled {
             CompiledStatement::PointInsert { schema, .. } => {
-                schema.with_row_key(params, 0, |key_bytes| -> Result<()> {
+                crate::constraint_eval::validate_check_constraints(schema, params)?;
+                let rowid = self
+                    .engine
+                    .auto_rowid
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                schema.with_row_key(params, rowid, |key_bytes| -> Result<()> {
                     schema.encode_row_value_into(params, val_buf)?;
                     tbl.put(key_bytes, val_buf)
                 })?;
@@ -292,7 +335,22 @@ impl<S: Storage> PreparedStatement<'_, S> {
                     let mut row = schema.decode_row_value(&val_bytes)?;
                     if *col_idx < row.len() {
                         row[*col_idx] = new_val.clone();
+                        crate::constraint_eval::validate_check_constraints(schema, &row)?;
                         let updated_bytes = schema.encode_row_value(&row)?;
+                        let is_pk_col = schema.pk_indices.contains(col_idx);
+                        if is_pk_col {
+                            let new_key = schema.encode_row_key(&row, 0);
+                            if new_key != key_bytes {
+                                if tbl.get(&new_key)?.is_some() {
+                                    return Err(DbError::Custom(
+                                        "Primary key uniqueness violation".into(),
+                                    ));
+                                }
+                                tbl.delete(&key_bytes)?;
+                                tbl.put(&new_key, &updated_bytes)?;
+                                return Ok(QueryResult::affected(1));
+                            }
+                        }
                         tbl.put(&key_bytes, &updated_bytes)?;
                         return Ok(QueryResult::affected(1));
                     }
@@ -350,33 +408,40 @@ impl<S: Storage> PreparedStatement<'_, S> {
 
     /// Execute prepared statement by beginning a dedicated transaction and committing.
     pub fn execute(&self, params: &[Value]) -> Result<QueryResult> {
-        if let CompiledStatement::PointQuery {
-            table_name,
-            schema,
-            projected_col_indices,
-            result_column_names,
-            pk_param_idx,
-            ..
-        } = &self.compiled
-        {
-            let pk_val = params
-                .get(*pk_param_idx)
-                .ok_or_else(|| DbError::Custom("Missing primary key parameter".into()))?;
-
-            let rx = self.engine.db.begin_read()?;
-            let tbl = rx.open_table(table_name)?;
-            Self::execute_point_lookup(
+        match &self.compiled {
+            CompiledStatement::PointQuery {
+                table_name,
                 schema,
                 projected_col_indices,
                 result_column_names,
-                &tbl,
-                pk_val,
-            )
-        } else {
-            let mut tx = self.engine.db.begin_write()?;
-            let res = self.execute_in_tx(&mut tx, params)?;
-            tx.commit()?;
-            Ok(res)
+                pk_param_idx,
+                ..
+            } => {
+                let pk_val = params
+                    .get(*pk_param_idx)
+                    .ok_or_else(|| DbError::Custom("Missing primary key parameter".into()))?;
+
+                let rx = self.engine.db.begin_read()?;
+                let tbl = rx.open_table(table_name)?;
+                Self::execute_point_lookup(
+                    schema,
+                    projected_col_indices,
+                    result_column_names,
+                    &tbl,
+                    pk_val,
+                )
+            }
+            CompiledStatement::General { plan } if matches!(&**plan, Plan::Select { .. }) => {
+                let mut substituted = *plan.clone();
+                crate::param_subst::substitute_plan_params(&mut substituted, params)?;
+                self.engine.execute_plan(substituted)
+            }
+            _ => {
+                let mut tx = self.engine.db.begin_write()?;
+                let res = self.execute_in_tx(&mut tx, params)?;
+                tx.commit()?;
+                Ok(res)
+            }
         }
     }
 }

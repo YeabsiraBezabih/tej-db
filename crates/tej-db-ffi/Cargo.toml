@@ -1,0 +1,32 @@
+[package]
+name = "tej-db-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description = "C ABI / FFI bindings for tej-db (Flutter, Dart, iOS, Android, Desktop)"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+tej-db.workspace = true
+tej-db-core.workspace = true
+tej-db-pager.workspace = true
+tej-db-txn.workspace = true
+tej-db-sql.workspace = true
+tej-db-vector.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

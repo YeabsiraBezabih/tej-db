@@ -77,6 +77,12 @@ impl FromStr for Timestamp {
             .parse()
             .map_err(|e| DbError::Custom(format!("Invalid day: {e}")))?;
 
+        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return Err(DbError::Custom(format!(
+                "Invalid calendar date components in '{s}'"
+            )));
+        }
+
         let mut hour = 0u32;
         let mut min = 0u32;
         let mut sec = 0u32;
@@ -85,13 +91,31 @@ impl FromStr for Timestamp {
         if parts.len() > 1 {
             let time_parts: Vec<&str> = parts[1].split(':').collect();
             if time_parts.len() >= 2 {
-                hour = time_parts[0].parse().unwrap_or(0);
-                min = time_parts[1].parse().unwrap_or(0);
+                hour = time_parts[0]
+                    .parse()
+                    .map_err(|e| DbError::Custom(format!("Invalid hour: {e}")))?;
+                min = time_parts[1]
+                    .parse()
+                    .map_err(|e| DbError::Custom(format!("Invalid minute: {e}")))?;
+                if hour > 23 || min > 59 {
+                    return Err(DbError::Custom(format!("Invalid hour or minute in '{s}'")));
+                }
                 if time_parts.len() >= 3 {
                     let sec_parts: Vec<&str> = time_parts[2].split('.').collect();
-                    sec = sec_parts[0].parse().unwrap_or(0);
+                    sec = sec_parts[0]
+                        .parse()
+                        .map_err(|e| DbError::Custom(format!("Invalid second: {e}")))?;
+                    if sec > 59 {
+                        return Err(DbError::Custom(format!("Invalid second in '{s}'")));
+                    }
                     if sec_parts.len() > 1 {
-                        let mut frac = sec_parts[1].to_string();
+                        let raw_frac = sec_parts[1];
+                        if !raw_frac.chars().all(|c| c.is_ascii_digit()) {
+                            return Err(DbError::Custom(format!(
+                                "Invalid fractional seconds in '{s}'"
+                            )));
+                        }
+                        let mut frac = raw_frac.to_string();
                         if frac.len() > 6 {
                             frac.truncate(6);
                         } else {

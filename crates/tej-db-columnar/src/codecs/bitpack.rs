@@ -41,7 +41,7 @@ impl BitPackingCodec {
             let dest = &mut out[start_offset..];
             for (i, &v) in values.iter().enumerate() {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let delta = ((v - min_val) as u8) & 0x0F;
+                let delta = ((i128::from(v) - i128::from(min_val)) as u8) & 0x0F;
                 if i % 2 == 0 {
                     dest[i / 2] = delta;
                 } else {
@@ -58,7 +58,7 @@ impl BitPackingCodec {
             for (i, &v) in values.iter().enumerate() {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 {
-                    dest[i] = (v - min_val) as u8;
+                    dest[i] = (i128::from(v) - i128::from(min_val)) as u8;
                 }
             }
             return out;
@@ -70,7 +70,7 @@ impl BitPackingCodec {
             let dest = &mut out[start_offset..];
             for (i, &v) in values.iter().enumerate() {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let delta = (v - min_val) as u16;
+                let delta = (i128::from(v) - i128::from(min_val)) as u16;
                 let b = delta.to_le_bytes();
                 dest[i * 2] = b[0];
                 dest[i * 2 + 1] = b[1];
@@ -84,7 +84,7 @@ impl BitPackingCodec {
             let mut bit_pos = 0;
 
             for &v in values {
-                let delta = u64::try_from(v - min_val).unwrap_or(0);
+                let delta = u64::try_from(i128::from(v) - i128::from(min_val)).unwrap_or(0);
                 for b in 0..bit_width {
                     let bit = ((delta >> b) & 1) as u8;
                     let byte_idx = start_offset + (bit_pos / 8);
@@ -108,6 +108,8 @@ impl BitPackingCodec {
     /// Decompresses Frame-of-Reference bit-packed bytes directly into a reusable destination vector,
     /// avoiding all intermediate heap allocations with branch-free word-level bit unpacking.
     pub fn decode_into(bytes: &[u8], out: &mut Vec<i64>) -> Result<()> {
+        const MAX_BITPACK_COUNT: usize = 10_000_000;
+
         if bytes.is_empty() {
             out.clear();
             return Ok(());
@@ -118,8 +120,30 @@ impl BitPackingCodec {
         }
 
         let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
+        if count > MAX_BITPACK_COUNT {
+            return Err(DbError::Custom(format!(
+                "Bitpack count {count} exceeds maximum allowed limit {MAX_BITPACK_COUNT}"
+            )));
+        }
         let min_val = i64::from_le_bytes(bytes[4..12].try_into().unwrap_or([0; 8]));
         let bit_width = bytes[12];
+
+        if bit_width > 64 {
+            return Err(DbError::Custom(format!(
+                "Invalid bitpack bit width: {bit_width}"
+            )));
+        }
+
+        let expected_payload = count
+            .checked_mul(usize::from(bit_width))
+            .map(|b| b.div_ceil(8))
+            .ok_or_else(|| DbError::Custom("Bitpack bit length integer overflow".into()))?;
+        let expected_bytes = 13usize
+            .checked_add(expected_payload)
+            .ok_or_else(|| DbError::Custom("Bitpack expected bytes integer overflow".into()))?;
+        if bytes.len() < expected_bytes {
+            return Err(DbError::Custom("Truncated bitpack payload".into()));
+        }
 
         out.clear();
         out.resize(count, 0);
@@ -127,11 +151,6 @@ impl BitPackingCodec {
         if bit_width == 0 {
             out.fill(min_val);
             return Ok(());
-        }
-
-        let expected_bytes = 13 + (count * usize::from(bit_width)).div_ceil(8);
-        if bytes.len() < expected_bytes {
-            return Err(DbError::Custom("Truncated bitpack payload".into()));
         }
 
         let payload = &bytes[13..];
@@ -299,7 +318,7 @@ impl BitPackingCodec {
 
             #[allow(clippy::cast_possible_wrap)]
             {
-                *item = min_val + (delta as i64);
+                *item = (i128::from(min_val) + i128::from(delta)) as i64;
             }
             bit_pos += bw;
         }

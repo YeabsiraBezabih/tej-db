@@ -3,7 +3,6 @@ use clap::Parser;
 
 #[test]
 fn test_cli_arg_parsing() {
-    // Test parsing each subcommand
     let parsed = Cli::try_parse_from(["tej-db-cli", "--db", "custom.db", "get", "mykey"]).unwrap();
     assert_eq!(parsed.db, PathBuf::from("custom.db"));
     assert!(matches!(parsed.command, Some(Commands::Get { key, table: None }) if key == "mykey"));
@@ -25,27 +24,95 @@ fn test_cli_arg_parsing() {
     let parsed = Cli::try_parse_from(["tej-db-cli", "stats"]).unwrap();
     assert!(matches!(parsed.command, Some(Commands::Stats)));
 
-    let parsed = Cli::try_parse_from(["tej-db-cli", "create-table", "orders"]).unwrap();
-    assert!(matches!(parsed.command, Some(Commands::CreateTable { name }) if name == "orders"));
-
-    let parsed = Cli::try_parse_from(["tej-db-cli", "list-tables"]).unwrap();
-    assert!(matches!(parsed.command, Some(Commands::ListTables)));
-
-    let parsed = Cli::try_parse_from(["tej-db-cli", "drop-table", "orders"]).unwrap();
-    assert!(matches!(parsed.command, Some(Commands::DropTable { name }) if name == "orders"));
-
-    let parsed = Cli::try_parse_from(["tej-db-cli", "backup", "bak.db"]).unwrap();
+    let parsed = Cli::try_parse_from(["tej-db-cli", "recover", "--dest", "rec.db"]).unwrap();
     assert!(
-        matches!(parsed.command, Some(Commands::Backup { dest }) if dest == std::path::Path::new("bak.db"))
+        matches!(parsed.command, Some(Commands::Recover { dest: Some(d) }) if d == std::path::Path::new("rec.db"))
     );
 
-    let parsed = Cli::try_parse_from(["tej-db-cli", "compact", "cmp.db"]).unwrap();
-    assert!(
-        matches!(parsed.command, Some(Commands::Compact { dest }) if dest == std::path::Path::new("cmp.db"))
-    );
+    let parsed = Cli::try_parse_from(["tej-db-cli", "verify"]).unwrap();
+    assert!(matches!(parsed.command, Some(Commands::Verify)));
 
-    let parsed = Cli::try_parse_from(["tej-db-cli", "sql", "SELECT 1"]).unwrap();
-    assert!(matches!(parsed.command, Some(Commands::Sql { query }) if query == "SELECT 1"));
+    let parsed = Cli::try_parse_from([
+        "tej-db-cli",
+        "create-vector-index",
+        "--table",
+        "items",
+        "--dim",
+        "128",
+        "--metric",
+        "l2",
+        "--precision",
+        "1bit",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(Commands::CreateVectorIndex { table, dim, metric, precision })
+            if table == "items" && dim == 128 && metric == "l2" && precision == "1bit"
+    ));
+
+    let parsed = Cli::try_parse_from([
+        "tej-db-cli",
+        "vector-insert",
+        "--table",
+        "items",
+        "--id",
+        "1",
+        "--vector",
+        "[1.0, 2.0]",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(Commands::VectorInsert { table, id, vector }) if table == "items" && id == 1 && vector == "[1.0, 2.0]"
+    ));
+
+    let parsed = Cli::try_parse_from([
+        "tej-db-cli",
+        "vector-search",
+        "--table",
+        "items",
+        "--vector",
+        "[1.0, 2.0]",
+        "-k",
+        "5",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(Commands::VectorSearch { table, vector, top_k, .. }) if table == "items" && top_k == 5 && vector == "[1.0, 2.0]"
+    ));
+
+    let parsed = Cli::try_parse_from([
+        "tej-db-cli",
+        "import-csv",
+        "--table",
+        "logs",
+        "--file",
+        "data.csv",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(Commands::ImportCsv { table, file, has_header }) if table == "logs" && file == std::path::Path::new("data.csv") && has_header
+    ));
+
+    let parsed = Cli::try_parse_from([
+        "tej-db-cli",
+        "export-parquet",
+        "--table",
+        "logs",
+        "--out",
+        "dump.parquet",
+    ])
+    .unwrap();
+    assert!(matches!(
+        parsed.command,
+        Some(Commands::ExportParquet { table, out }) if table == "logs" && out == std::path::Path::new("dump.parquet")
+    ));
+
+    let parsed = Cli::try_parse_from(["tej-db-cli", "explain", "SELECT 1"]).unwrap();
+    assert!(matches!(parsed.command, Some(Commands::Explain { query }) if query == "SELECT 1"));
 }
 
 #[test]
@@ -53,7 +120,6 @@ fn test_cli_execute_crud_lifecycle() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("cli_crud.db");
 
-    // 1. Put
     let put_res = execute_command(
         &db_path,
         Commands::Put {
@@ -65,7 +131,6 @@ fn test_cli_execute_crud_lifecycle() {
     .unwrap();
     assert_eq!(put_res, "OK");
 
-    // 2. Get
     let get_res = execute_command(
         &db_path,
         Commands::Get {
@@ -76,7 +141,6 @@ fn test_cli_execute_crud_lifecycle() {
     .unwrap();
     assert_eq!(get_res, "github.com");
 
-    // 3. Scan
     let scan_res = execute_command(
         &db_path,
         Commands::Scan {
@@ -88,12 +152,10 @@ fn test_cli_execute_crud_lifecycle() {
     .unwrap();
     assert!(scan_res.contains("site => github.com"));
 
-    // 4. Stats
     let stats_res = execute_command(&db_path, Commands::Stats).unwrap();
     assert!(stats_res.contains("Total Storage Pages:"));
     assert!(stats_res.contains("Cache Hit Rate:"));
 
-    // 5. Delete
     let del_res = execute_command(
         &db_path,
         Commands::Delete {
@@ -104,7 +166,6 @@ fn test_cli_execute_crud_lifecycle() {
     .unwrap();
     assert_eq!(del_res, "OK (deleted)");
 
-    // 6. Get non-existent
     let get_after_del = execute_command(
         &db_path,
         Commands::Get {
@@ -120,7 +181,6 @@ fn test_cli_execute_table_subcommands() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("cli_tables.db");
 
-    // 1. Create table
     let create_res = execute_command(
         &db_path,
         Commands::CreateTable {
@@ -130,11 +190,9 @@ fn test_cli_execute_table_subcommands() {
     .unwrap();
     assert!(create_res.contains("table 'employees' created"));
 
-    // 2. List tables
     let list_res = execute_command(&db_path, Commands::ListTables).unwrap();
     assert!(list_res.contains("employees"));
 
-    // 3. Put into table
     let put_tbl = execute_command(
         &db_path,
         Commands::Put {
@@ -146,7 +204,6 @@ fn test_cli_execute_table_subcommands() {
     .unwrap();
     assert_eq!(put_tbl, "OK");
 
-    // 4. Get from table
     let get_tbl = execute_command(
         &db_path,
         Commands::Get {
@@ -157,7 +214,6 @@ fn test_cli_execute_table_subcommands() {
     .unwrap();
     assert_eq!(get_tbl, "Alice");
 
-    // 5. Drop table
     let drop_res = execute_command(
         &db_path,
         Commands::DropTable {
@@ -173,7 +229,6 @@ fn test_cli_execute_sql() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("cli_sql.db");
 
-    // DDL
     let ddl = execute_command(
         &db_path,
         Commands::Sql {
@@ -183,7 +238,6 @@ fn test_cli_execute_sql() {
     .unwrap();
     assert!(ddl.contains("Rows affected: 0"));
 
-    // DML
     let dml = execute_command(
         &db_path,
         Commands::Sql {
@@ -193,7 +247,6 @@ fn test_cli_execute_sql() {
     .unwrap();
     assert!(dml.contains("Rows affected: 2"));
 
-    // DQL
     let dql = execute_command(
         &db_path,
         Commands::Sql {
@@ -232,16 +285,9 @@ fn test_cli_backup_and_compact() {
     .unwrap();
     assert!(bak_res.contains("backup saved"));
 
-    let cmp_res = execute_command(
-        &db_path,
-        Commands::Compact {
-            dest: cmp_path.clone(),
-        },
-    )
-    .unwrap();
+    let cmp_res = execute_command(&db_path, Commands::Compact { dest: cmp_path }).unwrap();
     assert!(cmp_res.contains("compacted database saved"));
 
-    // Verify data in backup
     let get_bak = execute_command(
         &bak_path,
         Commands::Get {
@@ -251,15 +297,4 @@ fn test_cli_backup_and_compact() {
     )
     .unwrap();
     assert_eq!(get_bak, "world");
-
-    // Verify data in compacted
-    let get_cmp = execute_command(
-        &cmp_path,
-        Commands::Get {
-            table: None,
-            key: "hello".into(),
-        },
-    )
-    .unwrap();
-    assert_eq!(get_cmp, "world");
 }

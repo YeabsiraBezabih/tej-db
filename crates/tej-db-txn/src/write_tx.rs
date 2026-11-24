@@ -116,6 +116,9 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
     }
 
     pub fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        if key.len() > tej_db_core::MAX_KEY_SIZE {
+            return Err(DbError::KeyTooLarge(key.len()));
+        }
         let is_ov = val.len() > tej_db_core::MAX_INLINE_VAL_SIZE;
         let item = if is_ov {
             let pid = self.btree.write_overflow_chain(val, &mut self.tx_pages)?;
@@ -133,7 +136,7 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
 
         if self.is_sorted {
             if let Some(last) = self.pending_writes.last() {
-                if key < last.0.as_slice() {
+                if key <= last.0.as_slice() {
                     self.is_sorted = false;
                 }
             }
@@ -159,7 +162,7 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
             let item = (tej_db_btree::InlineKey::from_slice(key), None, false);
             if self.is_sorted {
                 if let Some(last) = self.pending_writes.last() {
-                    if key < last.0.as_slice() {
+                    if key <= last.0.as_slice() {
                         self.is_sorted = false;
                     }
                 }
@@ -237,6 +240,9 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
     }
 
     pub fn put_table_key_idx(&mut self, idx: usize, key: &[u8], val: &[u8]) -> Result<()> {
+        if key.len() > tej_db_core::MAX_KEY_SIZE {
+            return Err(DbError::KeyTooLarge(key.len()));
+        }
         let state = &mut self.table_states[idx];
 
         let is_ov = val.len() > tej_db_core::MAX_INLINE_VAL_SIZE;
@@ -256,7 +262,7 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
 
         if state.is_sorted {
             if let Some(last) = state.pending_writes.last() {
-                if key < last.0.as_slice() {
+                if key <= last.0.as_slice() {
                     state.is_sorted = false;
                 }
             }
@@ -312,7 +318,7 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
             let item = (tej_db_btree::InlineKey::from_slice(key), None, false);
             if state.is_sorted {
                 if let Some(last) = state.pending_writes.last() {
-                    if key < last.0.as_slice() {
+                    if key <= last.0.as_slice() {
                         state.is_sorted = false;
                     }
                 }

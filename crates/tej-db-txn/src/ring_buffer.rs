@@ -11,6 +11,7 @@ pub const SLOT_WRITING: u32 = 1;
 pub const SLOT_READY: u32 = 2;
 pub const SLOT_COMMITTED: u32 = 3;
 pub const SLOT_CONFLICT: u32 = 4;
+pub const SLOT_ABORTED: u32 = 5;
 
 /// Cache-line padded slot (64 bytes aligned) eliminating hardware MESI false sharing.
 #[repr(align(64))]

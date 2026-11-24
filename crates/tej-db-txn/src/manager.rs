@@ -33,6 +33,7 @@ pub struct TxManager<S: Storage> {
     pub(crate) hooks: RwLock<Vec<(usize, Box<dyn Hook>)>>,
     next_hook_id: AtomicUsize,
     flusher_stop: RwLock<Arc<AtomicBool>>,
+    flusher_handle: parking_lot::Mutex<Option<std::thread::JoinHandle<()>>>,
     pub(crate) ring_buffer: ring_buffer::DisruptorRingBuffer,
 }
 
@@ -84,6 +85,7 @@ impl<S: Storage> TxManager<S> {
             hooks: RwLock::new(Vec::new()),
             next_hook_id: AtomicUsize::new(1),
             flusher_stop: RwLock::new(Arc::new(AtomicBool::new(false))),
+            flusher_handle: parking_lot::Mutex::new(None),
             ring_buffer: ring_buffer::DisruptorRingBuffer::new(),
         })
     }
@@ -207,23 +209,34 @@ impl<S: Storage> TxManager<S> {
         let cache = Arc::clone(&self.cache);
         let duration = std::time::Duration::from_millis(interval_ms.max(1));
 
-        std::thread::Builder::new()
+        if let Ok(handle) = std::thread::Builder::new()
             .name("tej-db-flusher".into())
             .spawn(move || {
                 while !stop_flag.load(Ordering::Relaxed) {
-                    std::thread::sleep(duration);
+                    let mut elapsed = std::time::Duration::ZERO;
+                    while elapsed < duration && !stop_flag.load(Ordering::Relaxed) {
+                        let step = std::time::Duration::from_millis(5)
+                            .min(duration.saturating_sub(elapsed));
+                        std::thread::sleep(step);
+                        elapsed += step;
+                    }
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
                     let _ = cache.sync();
                 }
             })
-            .ok();
+        {
+            *self.flusher_handle.lock() = Some(handle);
+        }
     }
 
     fn stop_flusher_thread(&self) {
         let stop_flag = self.flusher_stop.read();
         stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.flusher_handle.lock().take() {
+            let _ = handle.join();
+        }
     }
 
     #[must_use]
@@ -364,13 +377,20 @@ impl<S: Storage> TxManager<S> {
         if !combined_writes.is_empty() {
             combined_writes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             combined_writes.dedup_by(|a, b| a.0 == b.0);
-            if target_btree
-                .insert_sorted_batch_raw_in_tx(&combined_writes, &mut combined_pages)
-                .is_err()
+            if let Err(e) =
+                target_btree.insert_sorted_batch_raw_in_tx(&combined_writes, &mut combined_pages)
             {
                 for &pid in &combined_pages {
                     self.cache.free_page(pid);
                 }
+                for (ticket, _, _) in &approved_records {
+                    let slot = self.ring_buffer.get_slot(*ticket);
+                    slot.status
+                        .store(ring_buffer::SLOT_ABORTED, Ordering::Release);
+                }
+                self.ring_buffer.tail.store(scan_tail, Ordering::Release);
+                tracing::error!("Error committing cohort batch: {e}");
+                return;
             }
         }
 
@@ -378,6 +398,7 @@ impl<S: Storage> TxManager<S> {
 
         // Phase 4: Assign TxIDs and record history in single write lock
         let mut cur_next = self.next_tx_id.load(Ordering::Acquire);
+        let mut committed_slots = Vec::with_capacity(approved_records.len());
         {
             let mut history = self.commit_history.write();
             for (ticket, tables, keys) in approved_records {
@@ -388,19 +409,24 @@ impl<S: Storage> TxManager<S> {
                     tables,
                     keys,
                 });
-                let slot = self.ring_buffer.get_slot(ticket);
-                slot.assigned_tx_id.store(commit_tx, Ordering::Relaxed);
-                slot.status
-                    .store(ring_buffer::SLOT_COMMITTED, Ordering::Release);
+                committed_slots.push((ticket, commit_tx));
             }
             while history.len() > 2048 {
                 history.pop_front();
             }
         }
 
-        // Phase 5: Atomic metadata update and durability flush
-        self.active_root.store(new_root.0, Ordering::Release);
-        self.next_tx_id.store(cur_next, Ordering::Release);
+        // Phase 5: Two-Phase Durability Flush Barrier
+        match self.durability() {
+            DurabilityMode::Immediate => {
+                let _ = self.cache.flush_data_pages();
+                let _ = self.cache.sync();
+            }
+            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
+                let _ = self.cache.flush_data_pages();
+            }
+            DurabilityMode::None => {}
+        }
 
         if self.durability() != DurabilityMode::None {
             let tables = self.catalog.to_meta_entries();
@@ -408,22 +434,33 @@ impl<S: Storage> TxManager<S> {
             let meta = MetaPage::with_tables(new_root, catalog_root, TxId(cur_next), tables);
             let cur_sb = PageId(self.active_superblock.load(Ordering::Acquire));
             let target_sb = crate::superblock::choose_commit_superblock(cur_sb, TxId(cur_next));
-            let _ = crate::superblock::write_superblock(&self.cache, target_sb, &meta);
-            self.active_superblock.store(target_sb.0, Ordering::Release);
+            if crate::superblock::write_superblock(&self.cache, target_sb, &meta).is_ok() {
+                self.active_superblock.store(target_sb.0, Ordering::Release);
+                let _ = self.cache.flush_page(target_sb);
+                if self.durability() == DurabilityMode::Immediate {
+                    let _ = self.cache.sync();
+                }
+            }
         }
 
-        match self.durability() {
-            DurabilityMode::Immediate => {
-                let _ = self.cache.flush();
-            }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                let _ = self.cache.flush_to_storage();
-            }
-            DurabilityMode::None => {}
-        }
+        self.active_root.store(new_root.0, Ordering::Release);
+        self.next_tx_id.store(cur_next, Ordering::Release);
 
         // Phase 6: Advance Ring Buffer Tail
         self.ring_buffer.tail.store(scan_tail, Ordering::Release);
+
+        // Phase 7: Safe reclamation of retired pages after persistence
+        for pid in combined_pages.retired {
+            self.cache.free_page(pid);
+        }
+
+        // Phase 8: Notify approved followers only after persistence
+        for (ticket, commit_tx) in committed_slots {
+            let slot = self.ring_buffer.get_slot(ticket);
+            slot.assigned_tx_id.store(commit_tx, Ordering::Relaxed);
+            slot.status
+                .store(ring_buffer::SLOT_COMMITTED, Ordering::Release);
+        }
     }
 }
 

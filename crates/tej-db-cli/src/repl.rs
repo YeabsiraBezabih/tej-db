@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use std::io::{self, Write};
 use std::ops::Bound;
 use std::path::Path;
-use tej_db::Database;
-use tej_db_core::KeyRange;
+use tej_db::{Database, FileStorage, KeyRange, WriteTx};
 
 pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
     let db = Database::open_file(db_path)
@@ -16,12 +15,15 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
 
     let stdin = io::stdin();
     let mut current_table: Option<String> = None;
+    let mut active_tx: Option<WriteTx<'_, FileStorage>> = None;
 
     loop {
+        // Construct prompt indicating active table and transaction state
+        let tx_badge = if active_tx.is_some() { " (in-tx)" } else { "" };
         if let Some(ref t) = current_table {
-            print!("tej-db [{t}]> ");
+            print!("tej-db [{t}]{tx_badge}> ");
         } else {
-            print!("tej-db> ");
+            print!("tej-db{tx_badge}> ");
         }
         io::stdout().flush()?;
 
@@ -50,8 +52,15 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
             } else {
                 trimmed
             };
-            match sql_engine.execute(sql_str) {
-                Ok(res) => println!("{res}"),
+
+            let res = if let Some(ref mut tx) = active_tx {
+                sql_engine.execute_in_tx(tx, sql_str)
+            } else {
+                sql_engine.execute(sql_str)
+            };
+
+            match res {
+                Ok(out) => println!("{out}"),
                 Err(e) => eprintln!("SQL Error: {e}"),
             }
             continue;
@@ -59,7 +68,12 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
 
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         match parts[0] {
-            "exit" | "quit" | "\\q" => break,
+            "exit" | "quit" | "\\q" => {
+                if let Some(tx) = active_tx.take() {
+                    let _ = tx.rollback();
+                }
+                break;
+            }
             "help" => {
                 println!("Key-Value Commands:");
                 println!("  use [table]          Switch active table (or 'default')");
@@ -71,18 +85,114 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
                 println!("  delete <key>         Delete key");
                 println!("  scan [start] [end]   Scan range");
                 println!("  stats                Display database stats");
+                println!("  verify               Verify integrity and checksums");
                 println!("  backup <path>        Online snapshot backup");
                 println!("  compact <path>       Compact into target file");
-                println!("  exit / quit          Quit the shell");
+                println!();
+                println!("Transaction Commands:");
+                println!("  begin                Start an explicit ACID write transaction");
+                println!("  commit               Commit active transaction");
+                println!("  rollback             Abort active transaction");
+                println!("  savepoint <name>     Create named savepoint in transaction");
+                println!("  rollback to <name>   Roll back to named savepoint");
+                println!();
+                println!("Vector & Analytics Commands:");
+                println!("  vsearch <vec> [topk] KNN vector search on active table");
+                println!("  explain <query>      Analyze query plan and CBO route");
                 println!();
                 println!("SQL Commands:");
                 println!("  Run standard SQL directly or with 'sql <query>'");
-                println!(
-                    "  e.g.: CREATE TABLE users (id INT PRIMARY KEY, name TEXT, balance REAL);"
-                );
-                println!("        INSERT INTO users VALUES (1, 'Alice', 100.50);");
-                println!("        SELECT id, name FROM users WHERE id = 1;");
             }
+            "begin" => {
+                if active_tx.is_some() {
+                    eprintln!("A transaction is already active. Commit or rollback first.");
+                } else {
+                    match db.begin_write() {
+                        Ok(tx) => {
+                            active_tx = Some(tx);
+                            println!("OK: Transaction begun.");
+                        }
+                        Err(e) => eprintln!("Error beginning transaction: {e}"),
+                    }
+                }
+            }
+            "commit" => {
+                if let Some(tx) = active_tx.take() {
+                    match tx.commit() {
+                        Ok(()) => println!("OK: Transaction committed."),
+                        Err(e) => eprintln!("Error committing transaction: {e}"),
+                    }
+                } else {
+                    eprintln!("No active transaction to commit.");
+                }
+            }
+            "rollback" => {
+                if parts.len() >= 3 && parts[1] == "to" {
+                    let sp_name = parts[2];
+                    if let Some(ref mut tx) = active_tx {
+                        match tx.rollback_to_savepoint(sp_name) {
+                            Ok(()) => println!("OK: Rolled back to savepoint '{sp_name}'."),
+                            Err(e) => eprintln!("Error: {e}"),
+                        }
+                    } else {
+                        eprintln!("No active transaction.");
+                    }
+                } else if let Some(tx) = active_tx.take() {
+                    match tx.rollback() {
+                        Ok(()) => println!("OK: Transaction rolled back."),
+                        Err(e) => eprintln!("Error rolling back transaction: {e}"),
+                    }
+                } else {
+                    eprintln!("No active transaction to rollback.");
+                }
+            }
+            "savepoint" => {
+                if parts.len() < 2 {
+                    eprintln!("Usage: savepoint <name>");
+                } else if let Some(ref mut tx) = active_tx {
+                    tx.savepoint(parts[1]);
+                    println!("OK: Savepoint '{}' created.", parts[1]);
+                } else {
+                    eprintln!("Savepoints require an active transaction. Run 'begin' first.");
+                }
+            }
+            "vsearch" => {
+                if parts.len() < 2 {
+                    eprintln!("Usage: vsearch <[vector]> [top_k]");
+                } else {
+                    let vec_literal = parts[1];
+                    let top_k = parts
+                        .get(2)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(5);
+                    let tbl = current_table.as_deref().unwrap_or("default");
+                    match crate::cmd_vector::execute_vector_search(
+                        db_path,
+                        tbl,
+                        vec_literal,
+                        top_k,
+                        None,
+                    ) {
+                        Ok(res) => println!("{res}"),
+                        Err(e) => eprintln!("Vector search error: {e}"),
+                    }
+                }
+            }
+            "explain" => {
+                if parts.len() < 2 {
+                    eprintln!("Usage: explain <sql_query>");
+                } else {
+                    let query = parts[1..].join(" ");
+                    match crate::cmd_explain::execute_explain(db_path, &query) {
+                        Ok(res) => println!("{res}"),
+                        Err(e) => eprintln!("Explain error: {e}"),
+                    }
+                }
+            }
+            "verify" => match crate::cmd_admin::execute_verify(db_path) {
+                Ok(res) => println!("{res}"),
+                Err(e) => eprintln!("Verification error: {e}"),
+            },
             "use" => {
                 if parts.len() < 2 || parts[1] == "default" {
                     current_table = None;
@@ -133,12 +243,21 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
                 }
                 let key = parts[1];
                 let res = (|| -> Result<Option<Vec<u8>>> {
-                    let rx = db.begin_read()?;
-                    let val = if let Some(ref tbl) = current_table {
-                        let t = rx.open_table(tbl)?;
-                        t.get(key.as_bytes())?
+                    let val = if let Some(ref mut tx) = active_tx {
+                        if let Some(ref tbl) = current_table {
+                            let t = tx.open_table_mut(tbl)?;
+                            t.get(key.as_bytes())?
+                        } else {
+                            tx.get(key.as_bytes())?
+                        }
                     } else {
-                        rx.get(key.as_bytes())?
+                        let rx = db.begin_read()?;
+                        if let Some(ref tbl) = current_table {
+                            let t = rx.open_table(tbl)?;
+                            t.get(key.as_bytes())?
+                        } else {
+                            rx.get(key.as_bytes())?
+                        }
                     };
                     Ok(val)
                 })();
@@ -156,14 +275,23 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
                 let key = parts[1];
                 let val = parts[2..].join(" ");
                 let res = (|| -> Result<()> {
-                    let mut tx = db.begin_write()?;
-                    if let Some(ref tbl) = current_table {
-                        let mut t = tx.open_table_mut(tbl)?;
-                        t.put(key.as_bytes(), val.as_bytes())?;
+                    if let Some(ref mut tx) = active_tx {
+                        if let Some(ref tbl) = current_table {
+                            let mut t = tx.open_table_mut(tbl)?;
+                            t.put(key.as_bytes(), val.as_bytes())?;
+                        } else {
+                            tx.put(key.as_bytes(), val.as_bytes())?;
+                        }
                     } else {
-                        tx.put(key.as_bytes(), val.as_bytes())?;
+                        let mut tx = db.begin_write()?;
+                        if let Some(ref tbl) = current_table {
+                            let mut t = tx.open_table_mut(tbl)?;
+                            t.put(key.as_bytes(), val.as_bytes())?;
+                        } else {
+                            tx.put(key.as_bytes(), val.as_bytes())?;
+                        }
+                        tx.commit()?;
                     }
-                    tx.commit()?;
                     Ok(())
                 })();
                 match res {
@@ -178,15 +306,25 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
                 }
                 let key = parts[1];
                 let res = (|| -> Result<bool> {
-                    let mut tx = db.begin_write()?;
-                    let deleted = if let Some(ref tbl) = current_table {
-                        let mut t = tx.open_table_mut(tbl)?;
-                        t.delete(key.as_bytes())?
+                    if let Some(ref mut tx) = active_tx {
+                        let deleted = if let Some(ref tbl) = current_table {
+                            let mut t = tx.open_table_mut(tbl)?;
+                            t.delete(key.as_bytes())?
+                        } else {
+                            tx.delete(key.as_bytes())?
+                        };
+                        Ok(deleted)
                     } else {
-                        tx.delete(key.as_bytes())?
-                    };
-                    tx.commit()?;
-                    Ok(deleted)
+                        let mut tx = db.begin_write()?;
+                        let deleted = if let Some(ref tbl) = current_table {
+                            let mut t = tx.open_table_mut(tbl)?;
+                            t.delete(key.as_bytes())?
+                        } else {
+                            tx.delete(key.as_bytes())?
+                        };
+                        tx.commit()?;
+                        Ok(deleted)
+                    }
                 })();
                 match res {
                     Ok(true) => println!("OK (deleted)"),
@@ -231,21 +369,10 @@ pub(crate) fn run_repl(db_path: &Path) -> Result<()> {
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
-            "stats" => {
-                let stats = db.stats();
-                println!("Database Engine Statistics:");
-                println!("  Total Storage Pages: {}", stats.total_pages);
-                println!("  File Size:           {} bytes", stats.file_size_bytes);
-                println!("  Free / Reusable:     {} pages", stats.free_pages);
-                println!("  Cached Pages:        {}", stats.cached_pages);
-                println!("  Cache Hits:          {}", stats.cache_hits);
-                println!("  Cache Misses:        {}", stats.cache_misses);
-                println!(
-                    "  Cache Hit Rate:      {:.2}%",
-                    stats.cache_hit_rate * 100.0
-                );
-                println!("  Active Readers:      {}", stats.active_read_txns);
-            }
+            "stats" => match crate::cmd_admin::execute_stats(db_path) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!("Error: {e}"),
+            },
             "backup" => {
                 if parts.len() < 2 {
                     eprintln!("Usage: backup <dest_path>");

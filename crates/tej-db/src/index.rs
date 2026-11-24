@@ -52,14 +52,11 @@ impl SecondaryIndex {
         prefix.extend_from_slice(&(sec_key.len() as u16).to_be_bytes());
         prefix.extend_from_slice(sec_key);
 
-        let mut end_prefix = prefix.clone();
-        if let Some(last) = end_prefix.last_mut() {
-            *last = last.saturating_add(1);
-        }
+        let end_bound = prefix_successor_bound(&prefix);
 
         let range = KeyRange {
             start: Bound::Included(prefix.clone()),
-            end: Bound::Excluded(end_prefix),
+            end: end_bound,
         };
 
         let items: Vec<KV> = table.scan_range(&range)?;
@@ -150,4 +147,17 @@ impl<'a, S: Storage> QueryBuilder<'a, S> {
     pub fn execute(self) -> Result<Vec<KV>> {
         self.project(|k, v| KV::new(k.to_vec(), v.to_vec()))
     }
+}
+
+/// Compute the lexicographical upper exclusive bound for a prefix query.
+/// Carries across trailing 0xFF bytes, or returns `Bound::Unbounded` if all bytes are 0xFF.
+fn prefix_successor_bound(prefix: &[u8]) -> Bound<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xFF {
+            end.push(last + 1);
+            return Bound::Excluded(end);
+        }
+    }
+    Bound::Unbounded
 }

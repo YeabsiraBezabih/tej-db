@@ -109,3 +109,56 @@ async fn test_axum_concurrent_load() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_axum_sql_endpoint() {
+    let (app, _path) = setup_test_app();
+
+    // 1. Create table via POST /api/sql
+    let create_payload = serde_json::json!({
+        "sql": "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/sql")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&create_payload).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 2. Insert rows via POST /api/sql
+    let insert_payload = serde_json::json!({
+        "sql": "INSERT INTO products VALUES (101, 'Widget', 25), (102, 'Gadget', 45)"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/sql")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&insert_payload).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 3. Query via POST /api/sql
+    let select_payload = serde_json::json!({
+        "sql": "SELECT name, price FROM products WHERE id = 101"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/sql")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&select_payload).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(json["success"].as_bool().unwrap());
+    assert_eq!(json["data"]["columns"][0], "name");
+    assert_eq!(json["data"]["rows"][0][0], "Widget");
+    assert_eq!(json["data"]["rows"][0][1], 25);
+}

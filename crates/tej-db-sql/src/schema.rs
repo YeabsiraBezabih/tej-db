@@ -298,12 +298,12 @@ impl TableSchema {
         }
     }
 
-    /// Schema persistence catalog key inside the system table.
+    /// Dedicated internal SQL catalog table name, isolated from user KV keyspace.
+    pub const SQL_CATALOG_TABLE: &str = "__sys_sql_catalog__";
+
+    /// Schema persistence catalog key inside the dedicated SQL catalog table.
     #[must_use]
     pub fn catalog_key(table_name: &str) -> Vec<u8> {
-        let mut key = Vec::with_capacity(16 + table_name.len());
-        key.extend_from_slice(b"__sys:schema:");
-        key.extend_from_slice(table_name.to_ascii_lowercase().as_bytes());
-        key
+        table_name.to_ascii_lowercase().into_bytes()
     }
 }

@@ -1,5 +1,6 @@
 pub mod hooks;
 pub mod index;
+pub mod spatial_cluster;
 pub mod spatial_soa;
 pub mod spatial_viewport;
 pub mod typed;
@@ -15,18 +16,21 @@ pub use spatial_viewport::{
     SpatialViewportManager,
 };
 pub use tej_db_btree::BTreeIndex;
+pub use tej_db_core::spatial::{Aabb3D, BoundingSphere};
 pub use tej_db_core::{
     BatchOp, ChangeSet, DbError, DbStats, DurabilityMode, Hook, Index, KV, KeyRange,
     PAGE_HEADER_SIZE, PAGE_SIZE, Page, PageHeader, PageId, PageType, Result, Storage, TxId,
     WriteBatch,
 };
-#[cfg(feature = "mmap")]
+#[cfg(not(target_arch = "wasm32"))]
+pub use tej_db_pager::FileStorage;
+#[cfg(all(feature = "mmap", not(target_arch = "wasm32")))]
 pub use tej_db_pager::MmapStorage;
 #[cfg(feature = "compression")]
 pub use tej_db_pager::{CompressedStorage, compress_page, decompress_page};
 #[cfg(feature = "encryption")]
 pub use tej_db_pager::{EncryptedStorage, decrypt_page_data, encrypt_page_data};
-pub use tej_db_pager::{FileStorage, MemStorage, PageCache};
+pub use tej_db_pager::{MemStorage, PageCache};
 pub use tej_db_txn::{
     ReadOnlyTx, SHARDS_META_TABLE, ShardedTableDescriptor, ShardedTableMut, ShardedTableRef,
     TableMut, TableRef, TxManager, WriteTx, shard_name,
@@ -36,6 +40,7 @@ pub use typed::{KeyCodec, TypedTable, TypedTableMut};
 pub use vector::VectorIndex;
 
 use std::fmt;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -48,6 +53,15 @@ pub struct Database<S: Storage> {
     tx_manager: Arc<TxManager<S>>,
 }
 
+impl<S: Storage> Clone for Database<S> {
+    fn clone(&self) -> Self {
+        Self {
+            cache: Arc::clone(&self.cache),
+            tx_manager: Arc::clone(&self.tx_manager),
+        }
+    }
+}
+
 impl<S: Storage> fmt::Debug for Database<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Database")
@@ -57,6 +71,7 @@ impl<S: Storage> fmt::Debug for Database<S> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Database<FileStorage> {
     /// Open or create a file-backed database engine with default 4 MiB cache.
     pub fn open_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -105,17 +120,46 @@ impl Database<FileStorage> {
     /// Export an online, crash-safe, non-blocking snapshot backup to `dest_path`.
     ///
     /// Streams key-value records directly from snapshot pages without loading
-    /// the full database into intermediate heap memory.
+    /// the full database into intermediate heap memory. Safely backs up the default
+    /// table as well as all named tables, secondary indexes, sharded partitions, and catalogs.
     pub fn backup(&self, dest_path: impl AsRef<Path>) -> Result<()> {
+        let dest_p = dest_path.as_ref();
+        let src_p = self.cache.storage().read().path().to_path_buf();
+        if let (Ok(can_src), Ok(can_dest)) = (src_p.canonicalize(), dest_p.canonicalize()) {
+            if can_src == can_dest {
+                return Err(DbError::Custom(
+                    "Cannot backup database to its own source file path".into(),
+                ));
+            }
+        } else if src_p == dest_p {
+            return Err(DbError::Custom(
+                "Cannot backup database to its own source file path".into(),
+            ));
+        }
+
         let rx = self.begin_read()?;
-        let dest_db = Database::open_file(dest_path)?;
+        let dest_db = Database::open_file(dest_p)?;
         let mut dest_tx = dest_db.begin_write()?;
 
+        // 1. Stream copy default table
         let range = KeyRange::all();
         rx.scan_range_visitor(&range, |key, value| {
             dest_tx.put(key, value)?;
             Ok(true)
         })?;
+
+        // 2. Stream copy all tracked physical tables (named, partitioned, and catalog tables)
+        for tbl_name in rx.physical_tables() {
+            if tbl_name == "default" {
+                continue;
+            }
+            dest_tx.create_table(&tbl_name)?;
+            let tbl = rx.open_table(&tbl_name)?;
+            tbl.scan_range_visitor(&range, |key, value| {
+                dest_tx.put_table_key(&tbl_name, key, value)?;
+                Ok(true)
+            })?;
+        }
 
         dest_tx.commit()?;
         dest_db.sync()?;
@@ -157,7 +201,7 @@ impl Database<MemStorage> {
     }
 }
 
-#[cfg(feature = "mmap")]
+#[cfg(all(feature = "mmap", not(target_arch = "wasm32")))]
 impl Database<MmapStorage> {
     /// Open or create a memory-mapped database engine with default cache.
     pub fn open_mmap(path: impl AsRef<Path>) -> Result<Self> {

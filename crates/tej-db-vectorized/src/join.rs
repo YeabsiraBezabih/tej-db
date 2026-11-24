@@ -20,6 +20,9 @@ pub struct PhysicalHashJoin {
     bloom_filter: u64,
     out_types: Vec<PhysicalType>,
     is_open: bool,
+    cur_probe_chunk: Option<DataChunk>,
+    probe_row_cursor: usize,
+    build_match_cursor: usize,
 }
 
 impl PhysicalHashJoin {
@@ -56,6 +59,9 @@ impl PhysicalHashJoin {
             bloom_filter: 0,
             out_types,
             is_open: false,
+            cur_probe_chunk: None,
+            probe_row_cursor: 0,
+            build_match_cursor: 0,
         }
     }
 
@@ -247,8 +253,23 @@ impl PhysicalOperator for PhysicalHashJoin {
         }
 
         let build_slices: Vec<&[i64]> = self.build_columns.iter().map(Vec::as_slice).collect();
+        let mut out_chunk = DataChunk::new(&self.out_types, 2048);
+        let mut match_count = 0;
 
-        while let Some(probe_chunk) = self.probe_child.next()? {
+        loop {
+            if self.cur_probe_chunk.is_none() {
+                self.cur_probe_chunk = self.probe_child.next()?;
+                self.probe_row_cursor = 0;
+                self.build_match_cursor = 0;
+                if self.cur_probe_chunk.is_none() {
+                    break;
+                }
+            }
+
+            let probe_chunk = self
+                .cur_probe_chunk
+                .as_ref()
+                .ok_or_else(|| DbError::Custom("Unexpected missing probe chunk in join".into()))?;
             let probe_key_col = probe_chunk
                 .column(self.probe_key_col)
                 .ok_or_else(|| DbError::Custom("Probe key column missing".into()))?;
@@ -262,13 +283,16 @@ impl PhysicalOperator for PhysicalHashJoin {
                 })
                 .collect();
 
-            let mut out_chunk = DataChunk::new(&self.out_types, 2048);
-            let mut match_count = 0;
+            let num_probe_rows = probe_keys.len();
+            while self.probe_row_cursor < num_probe_rows {
+                let probe_row_idx = self.probe_row_cursor;
+                let pk = probe_keys[probe_row_idx];
 
-            for (probe_row_idx, &pk) in probe_keys.iter().enumerate() {
                 #[allow(clippy::cast_sign_loss)]
                 let bit = 1u64 << ((pk as u64) & 63);
                 if (self.bloom_filter & bit) == 0 {
+                    self.probe_row_cursor += 1;
+                    self.build_match_cursor = 0;
                     continue;
                 }
 
@@ -289,7 +313,8 @@ impl PhysicalOperator for PhysicalHashJoin {
                 };
 
                 if let Some(matching_build_rows) = matching_opt {
-                    for &build_row_idx in matching_build_rows {
+                    while self.build_match_cursor < matching_build_rows.len() {
+                        let build_row_idx = matching_build_rows[self.build_match_cursor];
                         let b_idx = build_row_idx as usize;
 
                         // Emit build columns
@@ -311,18 +336,25 @@ impl PhysicalOperator for PhysicalHashJoin {
                         }
 
                         match_count += 1;
+                        self.build_match_cursor += 1;
+
                         if match_count >= 2048 {
                             out_chunk.set_num_rows(match_count)?;
                             return Ok(Some(out_chunk));
                         }
                     }
                 }
+
+                self.probe_row_cursor += 1;
+                self.build_match_cursor = 0;
             }
 
-            if match_count > 0 {
-                out_chunk.set_num_rows(match_count)?;
-                return Ok(Some(out_chunk));
-            }
+            self.cur_probe_chunk = None;
+        }
+
+        if match_count > 0 {
+            out_chunk.set_num_rows(match_count)?;
+            return Ok(Some(out_chunk));
         }
 
         Ok(None)
@@ -330,6 +362,9 @@ impl PhysicalOperator for PhysicalHashJoin {
 
     fn close(&mut self) -> Result<()> {
         self.is_open = false;
+        self.cur_probe_chunk = None;
+        self.probe_row_cursor = 0;
+        self.build_match_cursor = 0;
         self.build_child.close()?;
         self.probe_child.close()
     }

@@ -97,11 +97,7 @@ impl<S: Storage> PageCache<S> {
         start_id: PageId,
         total_len: usize,
     ) -> Result<Option<Vec<u8>>> {
-        let mut out = Vec::with_capacity(total_len);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            out.set_len(total_len);
-        }
+        let mut out = vec![0u8; total_len];
         let storage = self.storage.read();
         if storage.read_overflow_payload(start_id, total_len, &mut out)? {
             Ok(Some(out))
@@ -145,7 +141,8 @@ impl<S: Storage> PageCache<S> {
     pub fn release_reader(&self) {
         if self.active_readers.fetch_sub(1, Ordering::SeqCst) == 1 {
             let mut pending = self.pending_free.lock();
-            if !pending.is_empty() {
+            // Verify under lock that no new reader arrived between fetch_sub and acquiring lock
+            if self.active_readers.load(Ordering::SeqCst) == 0 && !pending.is_empty() {
                 let mut free = self.free_list.lock();
                 free.append(&mut pending);
             }

@@ -96,6 +96,12 @@ impl<S: Storage> PageCache<S> {
         }
     }
 
+    /// Access the underlying storage lock.
+    #[must_use]
+    pub fn storage(&self) -> &parking_lot::RwLock<S> {
+        &self.storage
+    }
+
     #[inline]
     pub(crate) fn shard_index(&self, id: PageId) -> usize {
         if self.active_shards == 1 {

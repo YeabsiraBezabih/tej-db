@@ -4,20 +4,20 @@ pub mod mutate;
 pub mod node;
 pub mod overflow;
 pub mod search;
+pub mod tx_pages;
 
 #[cfg(test)]
 mod tests;
 
 pub use node::BTreeNode;
+pub use tx_pages::TxPageSet;
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tej_db_core::{Page, PageId, Result, Storage};
-use tej_db_pager::{FastPageIdBuildHasher, PageCache};
+use tej_db_pager::PageCache;
 
-pub type TxPageSet = HashSet<PageId, FastPageIdBuildHasher>;
 pub type InlineKey = smallvec::SmallVec<[u8; 32]>;
 pub type InlineVal = smallvec::SmallVec<[u8; 64]>;
 pub type RawBatchItem = (InlineKey, Option<InlineVal>, bool);

@@ -85,23 +85,40 @@ fi
 # Check 5: Production Safety Idioms (no unwrap/expect in runtime tej-db-* crates)
 # ------------------------------------------------------------------------------
 echo -e "\n${YELLOW}[5/5] Auditing production crates for unwrap/expect/panic in core runtime paths...${NC}"
-UNWRAP_VIOLATIONS=0
+UNWRAP_VIOLATIONS=$(python3 -c '
+import os, re, sys
 
-# Scan production files in crates/, skipping dedicated test files and test modules
-while IFS= read -r file; do
-    # Skip test files and CLI
-    if [[ "${file}" == *"tests.rs" ]] || [[ "${file}" == *"tej-db-cli"* ]]; then
-        continue
-    fi
-    # Search for unwrap()/expect() outside comments and tests
-    if grep -n -E '\.(unwrap|expect)\(' "${file}" | grep -v -E '(^\s*//|#\[test\]|#\[cfg\(test\))' > /dev/null 2>&1; then
-        # Check if they are in test functions
-        # For now, flag if found in non-test files
-        true
-    fi
-done < <(find crates -type f -name "*.rs")
+crates_dir = "crates"
+violations = 0
 
-echo -e "${GREEN}  PASS: Production runtime crates verified.${NC}"
+for root, dirs, files in os.walk(crates_dir):
+    for f in files:
+        if not f.endswith(".rs") or f.endswith("tests.rs") or "tej-db-cli" in root:
+            continue
+        filepath = os.path.join(root, f)
+        with open(filepath, "r", encoding="utf-8") as file:
+            in_test_module = False
+            for idx, line in enumerate(file, 1):
+                if "#[cfg(test)]" in line or "mod tests" in line:
+                    in_test_module = True
+                if in_test_module:
+                    continue
+                trimmed = line.strip()
+                if trimmed.startswith("//") or trimmed.startswith("/*") or trimmed.startswith("*"):
+                    continue
+                if re.search(r"\.(unwrap|expect)\(", line):
+                    print(f"  VIOLATION: {filepath}:{idx}: {trimmed}", file=sys.stderr)
+                    violations += 1
+
+print(violations)
+')
+
+if [ "${UNWRAP_VIOLATIONS}" -eq 0 ]; then
+    echo -e "${GREEN}  PASS: Production runtime crates verified with 0 unwrap/expect violations.${NC}"
+else
+    echo -e "${RED}  FAIL: Found ${UNWRAP_VIOLATIONS} unwrap()/expect() call(s) in production runtime paths!${NC}"
+    FAILED=1
+fi
 
 # ------------------------------------------------------------------------------
 # Final Verdict

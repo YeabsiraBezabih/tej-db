@@ -40,6 +40,10 @@ pub const OVERFLOW_FLAG: u16 = 0x8000;
 /// Aligned with SQLite (1002B) and standard 4-way B-Tree leaf fanout guarantees.
 pub const MAX_INLINE_VAL_SIZE: usize = 1000;
 
+/// Maximum allowable key size (in bytes) inside a 4 KiB slotted page.
+/// Enforces minimum 3-4 key fanout per B-Tree node and prevents split-induced allocation stalls.
+pub const MAX_KEY_SIZE: usize = 1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PageType {

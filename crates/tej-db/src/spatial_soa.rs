@@ -4,18 +4,64 @@ use tej_db_vectorized::spatial_culling::FrustumPlanes;
 /// and screen-space LOD culling across clusters without heap allocations.
 #[derive(Debug, Default, Clone)]
 pub struct SpatialSoACache {
-    pub x: Vec<f32>,
-    pub y: Vec<f32>,
-    pub z: Vec<f32>,
-    pub r: Vec<f32>,
-    pub lod_sq: Vec<f32>,
-    pub cluster_ids: Vec<u32>,
+    x: Vec<f32>,
+    y: Vec<f32>,
+    z: Vec<f32>,
+    r: Vec<f32>,
+    lod_sq: Vec<f32>,
+    cluster_ids: Vec<u32>,
 }
 
 impl SpatialSoACache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cluster_ids.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cluster_ids.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.x.clear();
+        self.y.clear();
+        self.z.clear();
+        self.r.clear();
+        self.lod_sq.clear();
+        self.cluster_ids.clear();
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.x.reserve(additional);
+        self.y.reserve(additional);
+        self.z.reserve(additional);
+        self.r.reserve(additional);
+        self.lod_sq.reserve(additional);
+        self.cluster_ids.reserve(additional);
+    }
+
+    #[must_use]
+    pub fn cluster_ids(&self) -> &[u32] {
+        &self.cluster_ids
+    }
+
+    #[inline]
+    fn safe_len(&self) -> usize {
+        self.cluster_ids
+            .len()
+            .min(self.x.len())
+            .min(self.y.len())
+            .min(self.z.len())
+            .min(self.r.len())
+            .min(self.lod_sq.len())
     }
 
     pub fn push(&mut self, center: [f32; 3], radius: f32, lod_error: f32, cluster_id: u32) {
@@ -45,7 +91,7 @@ impl SpatialSoACache {
     ) {
         visible_ids.clear();
         visible_indices.clear();
-        let len = self.cluster_ids.len();
+        let len = self.safe_len();
         let max_screen_error_sq = max_screen_error * max_screen_error;
         let planes = frustum.planes;
 
@@ -54,6 +100,10 @@ impl SpatialSoACache {
             let cy = self.y[i];
             let cz = self.z[i];
             let r = self.r[i];
+
+            if !cx.is_finite() || !cy.is_finite() || !cz.is_finite() || !r.is_finite() {
+                continue;
+            }
 
             let mut inside = true;
             for p in &planes {
@@ -112,7 +162,7 @@ impl SpatialSoACache {
     ) -> usize {
         use std::arch::x86_64::*;
 
-        let len = self.cluster_ids.len();
+        let len = self.safe_len();
         if len == 0 {
             return 0;
         }
@@ -258,8 +308,16 @@ impl SpatialSoACache {
             let d4 = p4[0] * x + p4[1] * y + p4[2] * z + p4[3] + r;
             let d5 = p5[0] * x + p5[1] * y + p5[2] * z + p5[3] + r;
 
-            let culled =
-                (d0 < 0.0) || (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0) || (d4 < 0.0) || (d5 < 0.0);
+            let culled = !x.is_finite()
+                || !y.is_finite()
+                || !z.is_finite()
+                || !r.is_finite()
+                || (d0 < 0.0)
+                || (d1 < 0.0)
+                || (d2 < 0.0)
+                || (d3 < 0.0)
+                || (d4 < 0.0)
+                || (d5 < 0.0);
             if !culled {
                 let dx = x - camera_pos[0];
                 let dy = y - camera_pos[1];
@@ -280,7 +338,7 @@ impl SpatialSoACache {
         camera_pos: [f32; 3],
         max_screen_error: f32,
     ) -> usize {
-        let len = self.cluster_ids.len();
+        let len = self.safe_len();
         if len == 0 {
             return 0;
         }
@@ -302,8 +360,16 @@ impl SpatialSoACache {
             let d4 = p4[0] * x + p4[1] * y + p4[2] * z + p4[3] + r;
             let d5 = p5[0] * x + p5[1] * y + p5[2] * z + p5[3] + r;
 
-            let culled =
-                (d0 < 0.0) || (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0) || (d4 < 0.0) || (d5 < 0.0);
+            let culled = !x.is_finite()
+                || !y.is_finite()
+                || !z.is_finite()
+                || !r.is_finite()
+                || (d0 < 0.0)
+                || (d1 < 0.0)
+                || (d2 < 0.0)
+                || (d3 < 0.0)
+                || (d4 < 0.0)
+                || (d5 < 0.0);
             if !culled {
                 let dx = x - camera_pos[0];
                 let dy = y - camera_pos[1];

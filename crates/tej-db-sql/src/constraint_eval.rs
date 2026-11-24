@@ -10,24 +10,22 @@ use tej_db_core::{DbError, KeyRange};
 pub fn validate_check_constraints(schema: &TableSchema, row: &[Value]) -> Result<()> {
     for check in &schema.check_constraints {
         let dialect = GenericDialect {};
-        let mut ast = Parser::parse_sql(&dialect, &format!("SELECT {}", check.expr_sql))
-            .map_err(|e| DbError::Custom(format!("Failed to parse CHECK constraint: {e}")))?;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(&check.expr_sql)
+            .map_err(|e| {
+                DbError::Custom(format!("Failed to parse CHECK constraint expression: {e}"))
+            })?;
+        let expr = parser.parse_expr().map_err(|e| {
+            DbError::Custom(format!("Failed to parse CHECK constraint expression: {e}"))
+        })?;
 
-        if let Some(sqlparser::ast::Statement::Query(q)) = ast.pop() {
-            if let sqlparser::ast::SetExpr::Select(select) = *q.body {
-                if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
-                    select.projection.into_iter().next()
-                {
-                    let result = evaluate_expr(&expr, schema, row)?;
-                    if result == Value::Boolean(false) {
-                        let name = check.name.as_deref().unwrap_or(&check.expr_sql);
-                        return Err(DbError::Custom(format!(
-                            "CHECK constraint violation '{name}' on table '{}'",
-                            schema.name
-                        )));
-                    }
-                }
-            }
+        let result = evaluate_expr(&expr, schema, row)?;
+        if result == Value::Boolean(false) {
+            let name = check.name.as_deref().unwrap_or(&check.expr_sql);
+            return Err(DbError::Custom(format!(
+                "CHECK constraint violation '{name}' on table '{}'",
+                schema.name
+            )));
         }
     }
     Ok(())

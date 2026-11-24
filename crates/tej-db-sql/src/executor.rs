@@ -9,45 +9,14 @@ use std::sync::atomic::Ordering;
 use tej_db::{Result, Storage, WriteTx};
 use tej_db_core::{DbError, KV};
 
-impl<S: Storage> SqlEngine<'_, S> {
+impl<S: Storage> SqlEngine<S> {
     /// Execute a planned query plan. If it is a read-only query (SELECT), a snapshot
     /// reader transaction is used; otherwise, a dedicated write transaction is opened and committed.
     pub fn execute_plan(&self, plan: Plan) -> Result<QueryResult> {
         match plan {
-            Plan::Select {
-                table,
-                projection,
-                key_range,
-                filter,
-                limit,
-            } => {
-                let schema = self
-                    .get_schema(&table)?
-                    .ok_or_else(|| DbError::TableNotFound(table.clone()))?;
-
+            Plan::Select { .. } => {
                 let rx = self.db.begin_read()?;
-                let tbl = rx.open_table(&table)?;
-
-                // Fast-path O(log N) point lookup when key range has identical included bounds
-                let is_point_lookup = match (&key_range.start, &key_range.end) {
-                    (Bound::Included(k1), Bound::Included(k2)) if k1 == k2 => Some(k1.as_slice()),
-                    _ => None,
-                };
-
-                let items = if let Some(pk) = is_point_lookup {
-                    tbl.get(pk)?
-                        .map(|val| {
-                            vec![KV {
-                                key: pk.to_vec(),
-                                value: val,
-                            }]
-                        })
-                        .unwrap_or_default()
-                } else {
-                    tbl.scan_range(&key_range)?
-                };
-
-                execute_select_from_items(&schema, &projection, filter.as_ref(), limit, items)
+                self.execute_select_on_rx(&rx, &plan)
             }
             dml_or_ddl => {
                 let mut tx = self.db.begin_write()?;
@@ -58,6 +27,51 @@ impl<S: Storage> SqlEngine<'_, S> {
         }
     }
 
+    /// Execute a SELECT plan against an existing read-only transaction.
+    pub(crate) fn execute_select_on_rx(
+        &self,
+        rx: &tej_db::ReadOnlyTx<S>,
+        plan: &Plan,
+    ) -> Result<QueryResult> {
+        if let Plan::Select {
+            table,
+            projection,
+            key_range,
+            filter,
+            limit,
+        } = plan
+        {
+            let schema = self
+                .get_schema(table)?
+                .ok_or_else(|| DbError::TableNotFound(table.clone()))?;
+
+            let tbl = rx.open_table(table)?;
+
+            // Fast-path O(log N) point lookup when key range has identical included bounds
+            let is_point_lookup = match (&key_range.start, &key_range.end) {
+                (Bound::Included(k1), Bound::Included(k2)) if k1 == k2 => Some(k1.as_slice()),
+                _ => None,
+            };
+
+            let items = if let Some(pk) = is_point_lookup {
+                tbl.get(pk)?
+                    .map(|val| {
+                        vec![KV {
+                            key: pk.to_vec(),
+                            value: val,
+                        }]
+                    })
+                    .unwrap_or_default()
+            } else {
+                tbl.scan_range(key_range)?
+            };
+
+            execute_select_from_items(&schema, projection, filter.as_ref(), *limit, items)
+        } else {
+            Err(DbError::Custom("Expected Plan::Select".into()))
+        }
+    }
+
     /// Execute a planned query plan inside an existing write transaction without committing.
     pub fn execute_plan_in_tx(&self, tx: &mut WriteTx<'_, S>, plan: &Plan) -> Result<QueryResult> {
         match plan {
@@ -65,13 +79,15 @@ impl<S: Storage> SqlEngine<'_, S> {
                 let table_name = schema.name.clone();
                 // 1. Create table in database
                 tx.create_table(&table_name)?;
+                let _ = tx.create_table(TableSchema::SQL_CATALOG_TABLE);
 
-                // 2. Persist schema in system catalog key
+                // 2. Persist schema in dedicated system catalog table
                 let cat_key = TableSchema::catalog_key(&table_name);
                 let cat_bytes = bincode::serialize(schema).map_err(|e| {
                     DbError::Serialization(format!("Catalog schema serialization failed: {e}"))
                 })?;
-                tx.put(&cat_key, &cat_bytes)?;
+                let mut cat_table = tx.open_table_mut(TableSchema::SQL_CATALOG_TABLE)?;
+                cat_table.put(&cat_key, &cat_bytes)?;
 
                 // 3. Cache schema
                 self.schemas
@@ -267,7 +283,18 @@ impl<S: Storage> SqlEngine<'_, S> {
                             }
                             crate::constraint_eval::validate_check_constraints(&schema, &row)?;
                             let updated_val = schema.encode_row_value(&row)?;
-                            tbl.put(pk, &updated_val)?;
+                            let new_key = schema.encode_row_key(&row, 0);
+                            if new_key == pk {
+                                tbl.put(pk, &updated_val)?;
+                            } else {
+                                if tbl.get(&new_key)?.is_some() {
+                                    return Err(DbError::Custom(
+                                        "Primary key uniqueness violation".into(),
+                                    ));
+                                }
+                                tbl.delete(pk)?;
+                                tbl.put(&new_key, &updated_val)?;
+                            }
                             updated_count = 1;
                             if let Some(ret) = returning {
                                 returned_rows
@@ -296,7 +323,18 @@ impl<S: Storage> SqlEngine<'_, S> {
 
                         crate::constraint_eval::validate_check_constraints(&schema, &row)?;
                         let updated_val = schema.encode_row_value(&row)?;
-                        tbl.put(&item.key, &updated_val)?;
+                        let new_key = schema.encode_row_key(&row, 0);
+                        if new_key == item.key {
+                            tbl.put(&item.key, &updated_val)?;
+                        } else {
+                            if tbl.get(&new_key)?.is_some() {
+                                return Err(DbError::Custom(
+                                    "Primary key uniqueness violation".into(),
+                                ));
+                            }
+                            tbl.delete(&item.key)?;
+                            tbl.put(&new_key, &updated_val)?;
+                        }
                         updated_count += 1;
                         if let Some(ret) = returning {
                             returned_rows

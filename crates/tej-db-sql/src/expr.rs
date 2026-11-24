@@ -5,8 +5,26 @@ use sqlparser::ast::{
 };
 use tej_db_core::{DbError, Result};
 
+/// Maximum recursion depth allowed during SQL expression evaluation to prevent stack overflows.
+const MAX_EXPR_DEPTH: usize = 64;
+
 /// Evaluate a SQL AST expression against a candidate row.
 pub fn evaluate_expr(expr: &SqlExpr, schema: &TableSchema, row: &[Value]) -> Result<Value> {
+    evaluate_expr_inner(expr, schema, row, 0)
+}
+
+fn evaluate_expr_inner(
+    expr: &SqlExpr,
+    schema: &TableSchema,
+    row: &[Value],
+    depth: usize,
+) -> Result<Value> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(DbError::Custom(
+            "SQL expression recursion depth limit exceeded (max 64)".into(),
+        ));
+    }
+
     match expr {
         SqlExpr::Identifier(ident) => {
             let col_name = ident.value.as_str();
@@ -37,7 +55,7 @@ pub fn evaluate_expr(expr: &SqlExpr, schema: &TableSchema, row: &[Value]) -> Res
             ))),
         },
         SqlExpr::UnaryOp { op, expr } => {
-            let inner = evaluate_expr(expr, schema, row)?;
+            let inner = evaluate_expr_inner(expr, schema, row, depth + 1)?;
             match op {
                 UnaryOperator::Not => match inner {
                     Value::Boolean(b) => Ok(Value::Boolean(!b)),
@@ -47,8 +65,12 @@ pub fn evaluate_expr(expr: &SqlExpr, schema: &TableSchema, row: &[Value]) -> Res
                     )),
                 },
                 UnaryOperator::Minus => match inner {
-                    Value::Integer(i) => Ok(Value::Integer(-i)),
+                    Value::Integer(i) => match i.checked_neg() {
+                        Some(res) => Ok(Value::Integer(res)),
+                        None => Err(DbError::Custom("Integer negation overflow".into())),
+                    },
                     Value::Real(r) => Ok(Value::Real(-r)),
+                    Value::Null => Ok(Value::Null),
                     _ => Err(DbError::Custom(
                         "Minus operator expects numeric operand".into(),
                     )),
@@ -59,19 +81,19 @@ pub fn evaluate_expr(expr: &SqlExpr, schema: &TableSchema, row: &[Value]) -> Res
             }
         }
         SqlExpr::BinaryOp { left, op, right } => {
-            let left_val = evaluate_expr(left, schema, row)?;
-            let right_val = evaluate_expr(right, schema, row)?;
+            let left_val = evaluate_expr_inner(left, schema, row, depth + 1)?;
+            let right_val = evaluate_expr_inner(right, schema, row, depth + 1)?;
             evaluate_binary_op(&left_val, op, &right_val)
         }
         SqlExpr::IsNull(inner) => {
-            let val = evaluate_expr(inner, schema, row)?;
+            let val = evaluate_expr_inner(inner, schema, row, depth + 1)?;
             Ok(Value::Boolean(val.is_null()))
         }
         SqlExpr::IsNotNull(inner) => {
-            let val = evaluate_expr(inner, schema, row)?;
+            let val = evaluate_expr_inner(inner, schema, row, depth + 1)?;
             Ok(Value::Boolean(!val.is_null()))
         }
-        SqlExpr::Nested(inner) => evaluate_expr(inner, schema, row),
+        SqlExpr::Nested(inner) => evaluate_expr_inner(inner, schema, row, depth + 1),
         SqlExpr::Function(func) => {
             let func_name = func.name.to_string();
             let args: &[FunctionArg] = match &func.args {
@@ -94,15 +116,20 @@ pub fn evaluate_expr(expr: &SqlExpr, schema: &TableSchema, row: &[Value]) -> Res
 #[allow(clippy::cast_precision_loss)]
 fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> Result<Value> {
     match op {
+        // Standard SQL 3-Valued Logic for AND
         BinaryOperator::And => match (left, right) {
-            (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(*a && *b)),
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
+            (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
+            (Value::Boolean(true) | Value::Null, Value::Null)
+            | (Value::Null, Value::Boolean(true)) => Ok(Value::Null),
             _ => Err(DbError::Custom("AND expects boolean operands".into())),
         },
+        // Standard SQL 3-Valued Logic for OR
         BinaryOperator::Or => match (left, right) {
-            (Value::Boolean(a), Value::Boolean(b)) => Ok(Value::Boolean(*a || *b)),
             (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
+            (Value::Boolean(false) | Value::Null, Value::Null)
+            | (Value::Null, Value::Boolean(false)) => Ok(Value::Null),
             _ => Err(DbError::Custom("OR expects boolean operands".into())),
         },
         BinaryOperator::Eq => match left.sql_cmp(right) {
@@ -140,14 +167,22 @@ fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> Resul
             None => Ok(Value::Null),
         },
         BinaryOperator::Plus => match (left, right) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_add(*b))),
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_add(*b) {
+                Some(res) => Ok(Value::Integer(res)),
+                None => Err(DbError::Custom("Integer addition overflow".into())),
+            },
             (Value::Real(a), Value::Real(b)) => Ok(Value::Real(a + b)),
             (Value::Integer(a), Value::Real(b)) => Ok(Value::Real(*a as f64 + b)),
             (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(a + *b as f64)),
             _ => Err(DbError::Custom("Addition expects numeric operands".into())),
         },
         BinaryOperator::Minus => match (left, right) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_sub(*b))),
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_sub(*b) {
+                Some(res) => Ok(Value::Integer(res)),
+                None => Err(DbError::Custom("Integer subtraction overflow".into())),
+            },
             (Value::Real(a), Value::Real(b)) => Ok(Value::Real(a - b)),
             (Value::Integer(a), Value::Real(b)) => Ok(Value::Real(*a as f64 - b)),
             (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(a - *b as f64)),
@@ -156,7 +191,11 @@ fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> Resul
             )),
         },
         BinaryOperator::Multiply => match (left, right) {
-            (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a.wrapping_mul(*b))),
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Integer(a), Value::Integer(b)) => match a.checked_mul(*b) {
+                Some(res) => Ok(Value::Integer(res)),
+                None => Err(DbError::Custom("Integer multiplication overflow".into())),
+            },
             (Value::Real(a), Value::Real(b)) => Ok(Value::Real(a * b)),
             (Value::Integer(a), Value::Real(b)) => Ok(Value::Real(*a as f64 * b)),
             (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(a * *b as f64)),
@@ -165,15 +204,34 @@ fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> Resul
             )),
         },
         BinaryOperator::Divide => match (left, right) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (Value::Integer(a), Value::Integer(b)) => {
                 if *b == 0 {
                     return Err(DbError::Custom("Division by zero".into()));
                 }
-                Ok(Value::Integer(a / b))
+                match a.checked_div(*b) {
+                    Some(res) => Ok(Value::Integer(res)),
+                    None => Err(DbError::Custom("Integer division overflow".into())),
+                }
             }
-            (Value::Real(a), Value::Real(b)) => Ok(Value::Real(a / b)),
-            (Value::Integer(a), Value::Real(b)) => Ok(Value::Real(*a as f64 / b)),
-            (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(a / *b as f64)),
+            (Value::Real(a), Value::Real(b)) => {
+                if *b == 0.0 {
+                    return Err(DbError::Custom("Division by zero".into()));
+                }
+                Ok(Value::Real(a / b))
+            }
+            (Value::Integer(a), Value::Real(b)) => {
+                if *b == 0.0 {
+                    return Err(DbError::Custom("Division by zero".into()));
+                }
+                Ok(Value::Real(*a as f64 / b))
+            }
+            (Value::Real(a), Value::Integer(b)) => {
+                if *b == 0 {
+                    return Err(DbError::Custom("Division by zero".into()));
+                }
+                Ok(Value::Real(a / *b as f64))
+            }
             _ => Err(DbError::Custom("Division expects numeric operands".into())),
         },
         _ => Err(DbError::Custom(format!(

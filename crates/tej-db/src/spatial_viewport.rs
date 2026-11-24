@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
-use tej_db_core::spatial::{
-    Aabb3D, BoundingSphere, MESHLET_HEADER_SIZE, MeshletPageHeader, encode_spatial_key,
-    quantize_position,
-};
+use tej_db_core::spatial::{Aabb3D, BoundingSphere, MESHLET_HEADER_SIZE, MeshletPageHeader};
 use tej_db_core::{PAGE_SIZE, Page, PageId, PageType, Result, Storage};
 use tej_db_txn::TxManager;
 pub use tej_db_vectorized::spatial_culling::{FrustumPlanes, Ray3D};
@@ -15,38 +12,7 @@ use crate::spatial_soa::SpatialSoACache;
 #[path = "spatial_tests.rs"]
 mod spatial_tests;
 
-/// Metadata describing a 3D spatial cluster (meshlet or Gaussian splat cluster)
-/// stored within the database.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ClusterMetadata {
-    pub cluster_id: u32,
-    pub bounds: Aabb3D,
-    pub sphere: BoundingSphere,
-    pub lod_level: u8,
-    pub lod_error: f32,
-    pub page_id: PageId,
-}
-
-impl ClusterMetadata {
-    #[must_use]
-    pub const fn new(
-        cluster_id: u32,
-        bounds: Aabb3D,
-        sphere: BoundingSphere,
-        lod_level: u8,
-        lod_error: f32,
-        page_id: PageId,
-    ) -> Self {
-        Self {
-            cluster_id,
-            bounds,
-            sphere,
-            lod_level,
-            lod_error,
-            page_id,
-        }
-    }
-}
+pub use crate::spatial_cluster::{ClusterMetadata, encode_composite_cluster_key};
 
 /// Differential visibility results returned after each camera movement evaluation.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,30 +81,50 @@ impl<S: Storage> SpatialViewportManager<S> {
             tx.commit()?;
         }
 
+        let mut clusters = Vec::new();
+        let mut soa = SpatialSoACache::new();
+
+        if let Ok(rx) = tx_manager.begin_read() {
+            if let Ok(tbl) = rx.open_table(&table_name) {
+                let _ = tbl.scan_range_visitor(&tej_db_core::KeyRange::all(), |_k, v| {
+                    if let Ok(cluster) = ClusterMetadata::from_bytes(v) {
+                        soa.push(
+                            cluster.sphere.center,
+                            cluster.sphere.radius,
+                            cluster.lod_error,
+                            cluster.cluster_id,
+                        );
+                        clusters.push(cluster);
+                    }
+                    Ok(true)
+                });
+            }
+        }
+
         Ok(Self {
             tx_manager,
             table_name,
             domain,
-            clusters: Vec::new(),
+            clusters,
             gpu_resident: RoaringBitmap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            soa: SpatialSoACache::new(),
+            soa,
             visible_id_scratch: Vec::new(),
             visible_cluster_indices: Vec::new(),
         })
-    }
-
-    /// Computes the 64-bit big-endian key for a cluster's LOD and center in the Morton curve.
-    fn encode_cluster_key(domain: &Aabb3D, lod: u8, center: [f32; 3]) -> [u8; 8] {
-        let (x, y, z) = quantize_position(center, domain);
-        encode_spatial_key(lod, x, y, z).to_be_bytes()
     }
 
     /// Number of registered clusters.
     #[must_use]
     pub fn cluster_count(&self) -> usize {
         self.clusters.len()
+    }
+
+    /// Looks up a cluster metadata by its cluster ID.
+    #[must_use]
+    pub fn get_cluster(&self, cluster_id: u32) -> Option<&ClusterMetadata> {
+        self.clusters.iter().find(|c| c.cluster_id == cluster_id)
     }
 
     /// Total bounding domain for Morton quantization.
@@ -153,11 +139,15 @@ impl<S: Storage> SpatialViewportManager<S> {
         &self.gpu_resident
     }
 
-    /// Registers a spatial cluster metadata entry, writing its Morton key index into the database table.
+    /// Registers a spatial cluster metadata entry, writing its composite Morton key index into the database table.
     pub fn register_cluster(&mut self, cluster: ClusterMetadata) -> Result<()> {
-        let key_bytes =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
-        let val_bytes = cluster.cluster_id.to_le_bytes();
+        let key_bytes = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
+        let val_bytes = cluster.to_bytes();
 
         let mut tx = self.tx_manager.begin_write()?;
         {
@@ -343,8 +333,12 @@ impl<S: Storage> SpatialViewportManager<S> {
         };
 
         // Old key deletion
-        let old_key =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
+        let old_key = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
 
         // Update bounds & sphere
         for i in 0..3 {
@@ -354,9 +348,13 @@ impl<S: Storage> SpatialViewportManager<S> {
         }
 
         // New key insertion
-        let new_key =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
-        let val = cluster.cluster_id.to_le_bytes();
+        let new_key = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
+        let val_bytes = cluster.to_bytes();
 
         self.soa
             .update_position(transform.cluster_id, cluster.sphere.center);
@@ -365,7 +363,7 @@ impl<S: Storage> SpatialViewportManager<S> {
         {
             let mut tbl = tx.open_table_mut(&self.table_name)?;
             tbl.delete(&old_key)?;
-            tbl.put(&new_key, &val)?;
+            tbl.put(&new_key, &val_bytes)?;
         }
         tx.commit()?;
 
@@ -389,8 +387,12 @@ impl<S: Storage> SpatialViewportManager<S> {
             return Ok(None);
         };
 
-        let old_key =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
+        let old_key = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
 
         // Invert translation
         for i in 0..3 {
@@ -399,9 +401,13 @@ impl<S: Storage> SpatialViewportManager<S> {
             cluster.sphere.center[i] -= transform.translation[i];
         }
 
-        let new_key =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
-        let val = cluster.cluster_id.to_le_bytes();
+        let new_key = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
+        let val_bytes = cluster.to_bytes();
 
         self.soa
             .update_position(transform.cluster_id, cluster.sphere.center);
@@ -410,7 +416,7 @@ impl<S: Storage> SpatialViewportManager<S> {
         {
             let mut tbl = tx.open_table_mut(&self.table_name)?;
             tbl.delete(&old_key)?;
-            tbl.put(&new_key, &val)?;
+            tbl.put(&new_key, &val_bytes)?;
         }
         tx.commit()?;
 
@@ -432,8 +438,12 @@ impl<S: Storage> SpatialViewportManager<S> {
             return Ok(None);
         };
 
-        let old_key =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
+        let old_key = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
 
         for i in 0..3 {
             cluster.bounds.min[i] += transform.translation[i];
@@ -441,9 +451,13 @@ impl<S: Storage> SpatialViewportManager<S> {
             cluster.sphere.center[i] += transform.translation[i];
         }
 
-        let new_key =
-            Self::encode_cluster_key(&self.domain, cluster.lod_level, cluster.sphere.center);
-        let val = cluster.cluster_id.to_le_bytes();
+        let new_key = encode_composite_cluster_key(
+            &self.domain,
+            cluster.lod_level,
+            cluster.sphere.center,
+            cluster.cluster_id,
+        );
+        let val_bytes = cluster.to_bytes();
 
         self.soa
             .update_position(transform.cluster_id, cluster.sphere.center);
@@ -452,7 +466,7 @@ impl<S: Storage> SpatialViewportManager<S> {
         {
             let mut tbl = tx.open_table_mut(&self.table_name)?;
             tbl.delete(&old_key)?;
-            tbl.put(&new_key, &val)?;
+            tbl.put(&new_key, &val_bytes)?;
         }
         tx.commit()?;
 

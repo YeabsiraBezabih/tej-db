@@ -1,3 +1,7 @@
+mod cmd_admin;
+mod cmd_data;
+mod cmd_explain;
+mod cmd_vector;
 mod repl;
 mod tui;
 
@@ -11,7 +15,7 @@ use tej_db::{Database, KeyRange};
 #[derive(Parser, Debug)]
 #[command(name = "tej-db-cli")]
 #[command(
-    about = "Interactive TUI and CLI demo shell for Modular ACID Embedded DBMS in Rust",
+    about = "Interactive TUI and CLI administration shell for Modular ACID Embedded DBMS in Rust",
     long_about = None
 )]
 struct Cli {
@@ -69,6 +73,14 @@ enum Commands {
     },
     /// Display database cache and transaction statistics
     Stats,
+    /// Recover a database file from crashes or torn writes
+    Recover {
+        /// Optional destination path to write recovered & compacted database
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
+    /// Verify internal consistency of active tables and page checksums
+    Verify,
     /// Create a new named table/keyspace
     CreateTable {
         /// Table name
@@ -96,6 +108,104 @@ enum Commands {
         /// SQL statement to execute
         query: String,
     },
+    /// Explain the physical execution plan and Cost-Based Optimizer route for a query
+    Explain {
+        /// SQL query to analyze
+        query: String,
+    },
+    /// Create a high-performance vector index on a table
+    CreateVectorIndex {
+        /// Table name
+        #[arg(short, long)]
+        table: String,
+        /// Vector dimensions
+        #[arg(short, long)]
+        dim: usize,
+        /// Distance metric (cosine, l2, dot)
+        #[arg(short, long, default_value = "cosine")]
+        metric: String,
+        /// Quantization precision (1bit, 2bit, full)
+        #[arg(short, long, default_value = "2bit")]
+        precision: String,
+    },
+    /// Insert a vector into a vector index delta table
+    VectorInsert {
+        /// Table name
+        #[arg(short, long)]
+        table: String,
+        /// Unique vector ID
+        #[arg(short, long)]
+        id: u64,
+        /// Float vector literal, e.g. "[0.1, 0.2, 0.3]"
+        #[arg(short, long)]
+        vector: String,
+    },
+    /// Search for nearest neighbors using SIMD or Vamana graph beam search
+    VectorSearch {
+        /// Table name
+        #[arg(short, long)]
+        table: String,
+        /// Query vector literal, e.g. "[0.1, 0.2, 0.3]"
+        #[arg(short, long)]
+        vector: String,
+        /// Number of top candidates to return
+        #[arg(short = 'k', long, default_value_t = 10)]
+        top_k: usize,
+        /// Optional distance metric override (cosine, l2, dot)
+        #[arg(short, long)]
+        metric: Option<String>,
+    },
+    /// Compact pending delta vectors into an optimized Vamana proximity graph
+    VectorCompact {
+        /// Table name
+        #[arg(short, long)]
+        table: String,
+        /// Vector dimensions
+        #[arg(short, long)]
+        dim: usize,
+        /// Distance metric (cosine, l2, dot)
+        #[arg(short, long, default_value = "cosine")]
+        metric: String,
+    },
+    /// Import tabular CSV file into a database table
+    ImportCsv {
+        /// Destination table name
+        #[arg(short, long)]
+        table: String,
+        /// CSV file path
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Whether the CSV file contains a header row
+        #[arg(long, default_value_t = true)]
+        has_header: bool,
+    },
+    /// Export table contents to a CSV file
+    ExportCsv {
+        /// Source table name
+        #[arg(short, long)]
+        table: String,
+        /// Output CSV destination path
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Import an Apache Parquet container file into a database table
+    ImportParquet {
+        /// Destination table name
+        #[arg(short, long)]
+        table: String,
+        /// Parquet file path
+        #[arg(short, long)]
+        file: PathBuf,
+    },
+    /// Export table contents to an Apache Parquet container file
+    ExportParquet {
+        /// Source table name
+        #[arg(short, long)]
+        table: String,
+        /// Output Parquet destination path
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,7 +214,6 @@ fn main() -> Result<()> {
 
     match cli.command {
         None | Some(Commands::Tui) => {
-            // Launch interactive TUI
             tui::run_tui(&cli.db)?;
         }
         Some(Commands::Repl) => {
@@ -197,30 +306,9 @@ pub(crate) fn execute_command(db_path: &std::path::Path, cmd: Commands) -> Resul
             }
             Ok(out.trim_end().to_string())
         }
-        Commands::Stats => {
-            let db = Database::open_file(db_path)
-                .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
-            let stats = db.stats();
-            let mut out = String::new();
-            out.push_str("TejDb Database Engine Statistics:\n");
-            let _ = writeln!(out, "  Total Storage Pages: {}", stats.total_pages);
-            let _ = writeln!(
-                out,
-                "  File Size (approx):  {} bytes",
-                stats.file_size_bytes
-            );
-            let _ = writeln!(out, "  Free / Reusable:     {} pages", stats.free_pages);
-            let _ = writeln!(out, "  Cached Pages:        {}", stats.cached_pages);
-            let _ = writeln!(out, "  Cache Hits:          {}", stats.cache_hits);
-            let _ = writeln!(out, "  Cache Misses:        {}", stats.cache_misses);
-            let _ = writeln!(
-                out,
-                "  Cache Hit Rate:      {:.2}%",
-                stats.cache_hit_rate * 100.0
-            );
-            let _ = write!(out, "  Active Readers:      {}", stats.active_read_txns);
-            Ok(out)
-        }
+        Commands::Stats => cmd_admin::execute_stats(db_path),
+        Commands::Recover { dest } => cmd_admin::execute_recover(db_path, dest.as_deref()),
+        Commands::Verify => cmd_admin::execute_verify(db_path),
         Commands::CreateTable { name } => {
             let db = Database::open_file(db_path)
                 .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
@@ -269,8 +357,48 @@ pub(crate) fn execute_command(db_path: &std::path::Path, cmd: Commands) -> Resul
             let result = engine.execute(&query)?;
             Ok(format!("{result}"))
         }
+        Commands::Explain { query } => cmd_explain::execute_explain(db_path, &query),
+        Commands::CreateVectorIndex {
+            table,
+            dim,
+            metric,
+            precision,
+        } => cmd_vector::execute_create_vector_index(db_path, &table, dim, &metric, &precision),
+        Commands::VectorInsert { table, id, vector } => {
+            cmd_vector::execute_vector_insert(db_path, &table, id, &vector)
+        }
+        Commands::VectorSearch {
+            table,
+            vector,
+            top_k,
+            metric,
+        } => cmd_vector::execute_vector_search(db_path, &table, &vector, top_k, metric.as_deref()),
+        Commands::VectorCompact { table, dim, metric } => {
+            cmd_vector::execute_vector_compact(db_path, &table, dim, &metric)
+        }
+        Commands::ImportCsv {
+            table,
+            file,
+            has_header,
+        } => {
+            let mode = if has_header {
+                cmd_data::CsvHeaderMode::WithHeader
+            } else {
+                cmd_data::CsvHeaderMode::WithoutHeader
+            };
+            cmd_data::execute_import_csv(db_path, &table, &file, mode)
+        }
+        Commands::ExportCsv { table, out } => cmd_data::execute_export_csv(db_path, &table, &out),
+        Commands::ImportParquet { table, file } => {
+            cmd_data::execute_import_parquet(db_path, &table, &file)
+        }
+        Commands::ExportParquet { table, out } => {
+            cmd_data::execute_export_parquet(db_path, &table, &out)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_ext;

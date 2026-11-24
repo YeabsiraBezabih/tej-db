@@ -5,9 +5,11 @@ use tej_db_core::{PageId, Result, Storage};
 use tej_db_txn::{ReadOnlyTx, TxManager, WriteTx};
 use tej_db_vector::{
     DistanceMetric, QuantizationPrecision, RaBitQQuantizer, SearchCandidate, VamanaGraph,
-    VamanaSearcher, VectorCompactor, VectorId, delta_table_name, insert_vector_delta,
-    scan_vector_delta,
+    VamanaSearcher, VectorCompactor, VectorId, insert_vector_delta, scan_vector_delta,
 };
+
+/// Internal system table storing root page IDs for vector indexes across restarts.
+pub const VECTOR_CATALOG_TABLE: &str = "__sys:vector_catalog";
 
 /// High-level Vector Index for a database table, combining:
 /// 1. ACID write-ahead delta buffer in a Copy-on-Write B+ tree.
@@ -62,14 +64,39 @@ impl<S: Storage> VectorIndex<S> {
         precision: QuantizationPrecision,
     ) -> Self {
         let quantizer = RaBitQQuantizer::new_with_precision(dimension, 0x5EED_C0DE, precision);
+        let table_str = table_name.into();
+
+        // Recover persisted root_page_id from vector catalog if present
+        let cat_key = format!("vector_root:{table_str}").into_bytes();
+        let initial_root = if let Ok(rx) = tx_manager.begin_read() {
+            if let Ok(tbl) = rx.open_table(VECTOR_CATALOG_TABLE) {
+                if let Ok(Some(bytes)) = tbl.get(&cat_key) {
+                    if bytes.len() == 8 {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&bytes);
+                        u64::from_be_bytes(b)
+                    } else {
+                        PageId::INVALID.0
+                    }
+                } else {
+                    PageId::INVALID.0
+                }
+            } else {
+                PageId::INVALID.0
+            }
+        } else {
+            PageId::INVALID.0
+        };
+
         let compactor = VectorCompactor::new(tx_manager, quantizer.clone());
+
         Self {
-            table_name: table_name.into(),
+            table_name: table_str,
             dimension,
             metric,
             quantizer,
             compactor,
-            root_page_id: Arc::new(AtomicU64::new(PageId::INVALID.0)),
+            root_page_id: Arc::new(AtomicU64::new(initial_root)),
             graph: Arc::new(RwLock::new(None)),
         }
     }
@@ -106,6 +133,11 @@ impl<S: Storage> VectorIndex<S> {
                 vector.len()
             )));
         }
+        if vector.iter().any(|f| f.is_nan() || f.is_infinite()) {
+            return Err(tej_db_core::DbError::Custom(
+                "Vector contains NaN or Infinite components".into(),
+            ));
+        }
         insert_vector_delta(tx, &self.table_name, vector_id, vector)
     }
 
@@ -113,53 +145,26 @@ impl<S: Storage> VectorIndex<S> {
     ///
     /// Swaps the active root page pointer atomically once compaction succeeds.
     pub fn compact(&self) -> Result<PageId> {
-        let deltas = {
-            let rx = self.compactor.manager.begin_read()?;
-            scan_vector_delta(&rx, &self.table_name)?
-        };
-
-        if deltas.is_empty() {
-            let current_raw = self.root_page_id.load(Ordering::Acquire);
-            return Ok(PageId(current_raw));
-        }
-
-        let raw_items: Vec<(VectorId, Vec<f32>)> = deltas
-            .iter()
-            .filter_map(|d| d.vector.as_ref().map(|v| (d.vector_id, v.clone())))
-            .collect();
-
-        if !raw_items.is_empty() {
-            let graph = Arc::new(VamanaGraph::build_from_vectors(
-                &raw_items,
-                &self.quantizer,
-                64,
-                160,
-            ));
-            let root_pid = graph.persist_to_storage(self.compactor.manager.cache())?;
-            *self.graph.write() = Some(Arc::clone(&graph));
-            self.root_page_id.store(root_pid.0, Ordering::Release);
-
-            // Clear processed entries from delta table
-            let delta_name = delta_table_name(&self.table_name);
-            let mut tx = self.compactor.manager.begin_write()?;
-            {
-                let mut tbl = tx.open_table_mut(&delta_name)?;
-                for d in &deltas {
-                    let key = d.vector_id.0.to_be_bytes();
-                    tbl.delete(&key)?;
-                }
-            }
-            tx.commit()?;
-
-            return Ok(root_pid);
-        }
-
         let current_raw = self.root_page_id.load(Ordering::Acquire);
         let current_root = PageId(current_raw);
         let new_root = self
             .compactor
             .compact_table_delta(&self.table_name, current_root)?;
         self.root_page_id.store(new_root.0, Ordering::Release);
+
+        // Invalidate in-memory graph cache so queries load newly compacted nodes
+        *self.graph.write() = None;
+
+        if new_root.is_valid() {
+            let mut tx = self.compactor.manager.begin_write()?;
+            {
+                let mut cat = tx.open_table_mut(VECTOR_CATALOG_TABLE)?;
+                let cat_key = format!("vector_root:{}", self.table_name).into_bytes();
+                cat.put(&cat_key, &new_root.0.to_be_bytes())?;
+            }
+            tx.commit()?;
+        }
+
         Ok(new_root)
     }
 
@@ -167,25 +172,80 @@ impl<S: Storage> VectorIndex<S> {
     /// Prioritizes the L2/L3 cache-resident RAM arena for microsecond beam search.
     pub fn search(
         &self,
-        _rx: &ReadOnlyTx<S>,
+        rx: &ReadOnlyTx<S>,
         query: &[f32],
         beam_width: usize,
         top_k: usize,
         filter: Option<&dyn Fn(VectorId) -> bool>,
     ) -> Result<Vec<SearchCandidate>> {
-        if let Some(graph) = self.graph.read().clone() {
-            return Ok(graph.search(query, &self.quantizer, beam_width, top_k, filter));
+        if query.len() != self.dimension {
+            return Err(tej_db_core::DbError::Custom(format!(
+                "Query dimension mismatch: expected {}, got {}",
+                self.dimension,
+                query.len()
+            )));
+        }
+        if query.iter().any(|f| f.is_nan() || f.is_infinite()) {
+            return Err(tej_db_core::DbError::Custom(
+                "Query vector contains NaN or Infinite components".into(),
+            ));
         }
 
+        let mut candidate_map: std::collections::HashMap<VectorId, SearchCandidate> =
+            std::collections::HashMap::new();
+
         let root = PageId(self.root_page_id.load(Ordering::Acquire));
-        if !root.is_valid() {
-            return Ok(Vec::new());
+        if root.is_valid() {
+            let searcher = VamanaSearcher::new(
+                Arc::clone(self.compactor.manager.cache()),
+                self.quantizer.clone(),
+            );
+            let base_candidates = searcher.search(root, query, beam_width, top_k * 2, filter)?;
+            for cand in base_candidates {
+                candidate_map.insert(cand.vector_id, cand);
+            }
         }
-        let searcher = VamanaSearcher::new(
-            Arc::clone(self.compactor.manager.cache()),
-            self.quantizer.clone(),
-        );
-        searcher.search(root, query, beam_width, top_k, filter)
+
+        // Incorporate pending uncompacted delta mutations
+        if let Ok(deltas) = scan_vector_delta(rx, &self.table_name) {
+            for d in deltas {
+                if let Some(v) = d.vector {
+                    if filter.is_none_or(|f| f(d.vector_id)) {
+                        let dist = match self.metric {
+                            DistanceMetric::L2 => {
+                                tej_db_vector::simd::l2_distance_squared(query, &v)
+                            }
+                            DistanceMetric::Cosine => {
+                                tej_db_vector::simd::cosine_distance(query, &v)
+                            }
+                            DistanceMetric::DotProduct => {
+                                tej_db_vector::simd::dot_product(query, &v)
+                            }
+                        };
+                        candidate_map.insert(
+                            d.vector_id,
+                            SearchCandidate {
+                                page_id: PageId::INVALID,
+                                vector_id: d.vector_id,
+                                distance: dist,
+                            },
+                        );
+                    }
+                } else {
+                    candidate_map.remove(&d.vector_id);
+                }
+            }
+        }
+
+        let mut candidates: Vec<SearchCandidate> = candidate_map.into_values().collect();
+        candidates.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(top_k);
+
+        Ok(candidates)
     }
 
     /// Performs exact full-precision distance reranking on top candidates.

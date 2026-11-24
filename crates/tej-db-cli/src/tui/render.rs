@@ -207,7 +207,11 @@ fn render_explorer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!(" Key Store Catalog ({} keys) ", app.keys.len()))
+                .title(format!(
+                    " Key Store Catalog [{}] ({} keys) ",
+                    app.current_table_name(),
+                    app.keys.len()
+                ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded),
         )
@@ -230,6 +234,13 @@ fn render_explorer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
         vec![
             Line::from(vec![
+                Span::styled("Table:        ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    app.current_table_name().to_string(),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled("Payload Size: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{} bytes", val.len()),
@@ -249,7 +260,7 @@ fn render_explorer(f: &mut Frame<'_>, app: &mut App, area: Rect) {
         ]
     } else {
         vec![Line::from(Span::styled(
-            "No key selected or database empty. Press 'r' to reload.",
+            "No key selected or database empty. Press 'r' to reload, 't' to switch table.",
             Style::default().fg(Color::DarkGray),
         ))]
     };
@@ -306,7 +317,7 @@ fn render_footer(f: &mut Frame<'_>, app: &App, area: Rect) {
         }
         ActiveTab::Explorer => {
             format!(
-                " [↑/↓] Select | [d] Delete Key | [r] Refresh | [Tab] Switch | [q] Quit | {msg}"
+                " [↑/↓] Select | [d] Delete | [t] Next Table | [r] Refresh | [Tab] Switch | [q] Quit | {msg}"
             )
         }
         ActiveTab::Dashboard => {

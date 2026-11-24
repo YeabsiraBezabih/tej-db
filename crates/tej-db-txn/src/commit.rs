@@ -53,6 +53,19 @@ impl<S: Storage> WriteTx<'_, S> {
             }
         }
 
+        // Durability Barrier Phase 1: Flush all modified data pages and sync before updating superblock
+        match self.manager.durability() {
+            DurabilityMode::Immediate => {
+                self.manager.cache.flush_data_pages()?;
+                self.manager.cache.sync()?;
+            }
+            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
+                self.manager.cache.flush_data_pages()?;
+            }
+            DurabilityMode::None => {}
+        }
+
+        // Durability Barrier Phase 2: Write and flush alternating superblock
         if self.manager.durability() != DurabilityMode::None {
             let tables = self.manager.catalog.to_meta_entries();
             let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
@@ -63,22 +76,22 @@ impl<S: Storage> WriteTx<'_, S> {
             self.manager
                 .active_superblock
                 .store(target_sb.0, Ordering::Release);
-        }
 
-        match self.manager.durability() {
-            DurabilityMode::Immediate => {
-                self.manager.cache.flush()?;
+            self.manager.cache.flush_page(target_sb)?;
+            if self.manager.durability() == DurabilityMode::Immediate {
+                self.manager.cache.sync()?;
             }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                self.manager.cache.flush_to_storage()?;
-            }
-            DurabilityMode::None => {}
         }
 
         self.manager
             .active_root
             .store(new_root.0, Ordering::Release);
         self.manager.next_tx_id.store(new_next, Ordering::Release);
+
+        // Safe reclamation: free retired pages after superblock sync
+        for pid in self.tx_pages.retired.drain(..) {
+            self.manager.cache.free_page(pid);
+        }
 
         Ok(TxId(commit_tx_id))
     }
@@ -217,18 +230,30 @@ impl<S: Storage> WriteTx<'_, S> {
         if !combined_writes.is_empty() {
             combined_writes.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             combined_writes.dedup_by(|a, b| a.0 == b.0);
-            if target_btree
-                .insert_sorted_batch_raw_in_tx(&combined_writes, &mut combined_pages)
-                .is_err()
+            if let Err(e) =
+                target_btree.insert_sorted_batch_raw_in_tx(&combined_writes, &mut combined_pages)
             {
                 for &pid in &combined_pages {
                     self.manager.cache.free_page(pid);
                 }
+                for (ticket, _, _) in &approved_records {
+                    let slot = self.manager.ring_buffer.get_slot(*ticket);
+                    slot.status
+                        .store(ring_buffer::SLOT_ABORTED, Ordering::Release);
+                }
+                if !cohort_tickets.is_empty() {
+                    self.manager
+                        .ring_buffer
+                        .tail
+                        .store(scan_tail, Ordering::Release);
+                }
+                return Err(e);
             }
         }
 
         let new_root = target_btree.root_id();
 
+        let mut committed_slots = Vec::with_capacity(approved_records.len());
         {
             let mut history = self.manager.commit_history.write();
             history.push_back(CommittedTxRecord {
@@ -245,23 +270,26 @@ impl<S: Storage> WriteTx<'_, S> {
                     tables,
                     keys,
                 });
-                let slot = self.manager.ring_buffer.get_slot(ticket);
-                slot.assigned_tx_id.store(commit_tx, Ordering::Relaxed);
-                slot.status
-                    .store(ring_buffer::SLOT_COMMITTED, Ordering::Release);
+                committed_slots.push((ticket, commit_tx));
             }
             while history.len() > 2048 {
                 history.pop_front();
             }
         }
 
-        if !cohort_tickets.is_empty() {
-            self.manager
-                .ring_buffer
-                .tail
-                .store(scan_tail, Ordering::Release);
+        // Durability Barrier Phase 1: Flush data pages and sync before superblock update
+        match self.manager.durability() {
+            DurabilityMode::Immediate => {
+                self.manager.cache.flush_data_pages()?;
+                self.manager.cache.sync()?;
+            }
+            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
+                self.manager.cache.flush_data_pages()?;
+            }
+            DurabilityMode::None => {}
         }
 
+        // Durability Barrier Phase 2: Write and flush alternating superblock
         if self.manager.durability() != DurabilityMode::None {
             let tables = self.manager.catalog.to_meta_entries();
             let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
@@ -273,16 +301,11 @@ impl<S: Storage> WriteTx<'_, S> {
             self.manager
                 .active_superblock
                 .store(target_sb.0, Ordering::Release);
-        }
 
-        match self.manager.durability() {
-            DurabilityMode::Immediate => {
-                self.manager.cache.flush()?;
+            self.manager.cache.flush_page(target_sb)?;
+            if self.manager.durability() == DurabilityMode::Immediate {
+                self.manager.cache.sync()?;
             }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                self.manager.cache.flush_to_storage()?;
-            }
-            DurabilityMode::None => {}
         }
 
         self.manager
@@ -291,6 +314,29 @@ impl<S: Storage> WriteTx<'_, S> {
         self.manager
             .next_tx_id
             .store(next_assign_tx, Ordering::Release);
+
+        if !cohort_tickets.is_empty() {
+            self.manager
+                .ring_buffer
+                .tail
+                .store(scan_tail, Ordering::Release);
+        }
+
+        // Safe reclamation: free retired pages after superblock sync
+        for pid in self.tx_pages.retired.drain(..) {
+            self.manager.cache.free_page(pid);
+        }
+        for pid in combined_pages.retired {
+            self.manager.cache.free_page(pid);
+        }
+
+        // Notify followers only after full durability and persistence
+        for (ticket, commit_tx) in committed_slots {
+            let slot = self.manager.ring_buffer.get_slot(ticket);
+            slot.assigned_tx_id.store(commit_tx, Ordering::Relaxed);
+            slot.status
+                .store(ring_buffer::SLOT_COMMITTED, Ordering::Release);
+        }
 
         Ok(TxId(leader_commit_tx))
     }
@@ -314,9 +360,7 @@ impl<S: Storage> WriteTx<'_, S> {
 
         // 3. Sort pending writes in contiguous memory and deduplicate
         let mut pending = std::mem::take(&mut self.pending_writes);
-        if self.is_sorted {
-            pending.dedup_by(|a, b| a.0 == b.0);
-        } else {
+        if !self.is_sorted {
             pending.reverse();
             pending.sort_by(|a, b| a.0.cmp(&b.0));
             pending.dedup_by(|a, b| a.0 == b.0);
@@ -419,6 +463,11 @@ impl<S: Storage> WriteTx<'_, S> {
                     key: Vec::new(),
                     committed_tx: conf_tx,
                 });
+            }
+            if s == ring_buffer::SLOT_ABORTED {
+                slot.status
+                    .store(ring_buffer::SLOT_EMPTY, Ordering::Release);
+                return Err(DbError::TxAborted);
             }
 
             if spins < 32 {

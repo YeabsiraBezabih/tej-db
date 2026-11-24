@@ -58,6 +58,12 @@ pub enum DbError {
     )]
     WriteConflict { key: Vec<u8>, committed_tx: u64 },
 
+    #[error("Database file is locked by another process: {0}")]
+    Locked(String),
+
+    #[error("Key size {0} exceeds maximum allowable key size")]
+    KeyTooLarge(usize),
+
     #[error("Internal engine error: {0}")]
     Internal(String),
 

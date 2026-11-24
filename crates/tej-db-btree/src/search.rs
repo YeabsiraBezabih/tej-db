@@ -274,7 +274,10 @@ impl<S: Storage> BTreeIndex<S> {
                                 Ok(Step::Overflow(first_page, total_len))
                             } else {
                                 let val = page.leaf_get_val(idx)?;
-                                let res = (f_opt.take().expect("closure available"))(val)?;
+                                let f = f_opt.take().ok_or_else(|| {
+                                    DbError::Custom("Closure already consumed".into())
+                                })?;
+                                let res = f(val)?;
                                 Ok(Step::Done(Some(res)))
                             }
                         } else {
@@ -294,7 +297,9 @@ impl<S: Storage> BTreeIndex<S> {
                 Step::Overflow(first_page, total_len) => {
                     #[allow(clippy::cast_possible_truncation)]
                     let total = total_len as usize;
-                    let f = f_opt.take().expect("closure available");
+                    let f = f_opt
+                        .take()
+                        .ok_or_else(|| DbError::Custom("Closure already consumed".into()))?;
                     return self.cache.with_overflow_payload(first_page, total, f);
                 }
                 Step::Next(child_id) => curr_id = child_id,

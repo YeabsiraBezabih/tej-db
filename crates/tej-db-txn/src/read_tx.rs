@@ -88,6 +88,16 @@ impl<S: Storage> ReadOnlyTx<S> {
         Ok(tables)
     }
 
+    /// Return all physical table names currently tracked in the catalog snapshot,
+    /// including internal, secondary index, and sharded tables.
+    #[must_use]
+    pub fn physical_tables(&self) -> Vec<String> {
+        self.catalog_snapshot
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
     pub fn open_table(&self, name: &str) -> Result<TableRef<'_, S>> {
         if name == "default" {
             return Ok(TableRef::new(name, self.btree.clone(), self));

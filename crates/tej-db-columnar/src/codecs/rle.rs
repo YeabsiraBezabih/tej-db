@@ -44,6 +44,8 @@ impl RleCodec {
     /// Decompresses Run-Length Encoded bytes directly into a reusable destination vector,
     /// avoiding intermediate vector allocations using bulk slice resizing.
     pub fn decode_into(bytes: &[u8], out: &mut Vec<i64>) -> Result<()> {
+        const MAX_RLE_COUNT: usize = 10_000_000;
+
         if bytes.is_empty() {
             out.clear();
             return Ok(());
@@ -54,6 +56,11 @@ impl RleCodec {
         }
 
         let total_count = u32::from_le_bytes(bytes[0..4].try_into().unwrap_or([0; 4])) as usize;
+        if total_count > MAX_RLE_COUNT {
+            return Err(DbError::Custom(format!(
+                "RLE total_count {total_count} exceeds maximum allowed limit {MAX_RLE_COUNT}"
+            )));
+        }
         out.clear();
         out.reserve(total_count);
 
@@ -64,6 +71,12 @@ impl RleCodec {
             let val =
                 i64::from_le_bytes(bytes[offset + 4..offset + 12].try_into().unwrap_or([0; 8]));
             offset += 12;
+
+            if out.len() + run_len > total_count {
+                return Err(DbError::Custom(
+                    "RLE run exceeds declared total_count".into(),
+                ));
+            }
 
             out.resize(out.len() + run_len, val);
         }

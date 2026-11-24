@@ -10,6 +10,7 @@ members = [
     "crates/tej-db-columnar",
     "crates/tej-db-vectorized",
     "crates/tej-db-cli",
+    "crates/tej-db-ffi",
     "tests",
     "benches",
     "examples/axum-api",
@@ -40,6 +41,7 @@ tej-db-vector = { version = "0.1.0", path = "crates/tej-db-vector" }
 tej-db-columnar = { version = "0.1.0", path = "crates/tej-db-columnar" }
 tej-db-vectorized = { version = "0.1.0", path = "crates/tej-db-vectorized" }
 tej-db-cli = { version = "0.1.0", path = "crates/tej-db-cli" }
+tej-db-ffi = { version = "0.1.0", path = "crates/tej-db-ffi" }
 
 # Error handling
 thiserror = "2.0"
@@ -85,12 +87,15 @@ bincode = "1.3"
 memmap2 = "0.9"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 chacha20poly1305 = "0.10"
+zeroize = "1.9"
+getrandom = { version = "0.2", features = ["js"] }
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [profile.bench]

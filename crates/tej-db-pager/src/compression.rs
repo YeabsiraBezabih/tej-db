@@ -6,23 +6,48 @@ use tej_db_core::{DbError, PAGE_SIZE, PageId, Result, Storage};
 /// Magic identifier for compressed pages: "LZ4P".
 pub const COMPRESSION_MAGIC: [u8; 4] = *b"LZ4P";
 
-/// Compress a page payload using LZ4.
+/// Minimum size reduction (in bytes) required to store a page compressed.
+const MIN_COMPRESSION_SAVINGS: usize = 64;
+
+/// Compress a page payload using LZ4 with a 4-byte uncompressed length prefix.
 #[cfg(feature = "compression")]
 pub fn compress_page(src: &[u8]) -> Vec<u8> {
     lz4_flex::block::compress_prepend_size(src)
 }
 
-/// Decompress an LZ4-compressed page payload.
+/// Decompresses an LZ4-compressed payload safely, strictly bounded by `PAGE_SIZE`.
+///
+/// Prevents decompression bomb attacks by enforcing `uncomp_size <= PAGE_SIZE` (4096),
+/// rejecting any crafted header with oversized or negative lengths before allocation.
 #[cfg(feature = "compression")]
 pub fn decompress_page(src: &[u8]) -> Result<Vec<u8>> {
-    lz4_flex::block::decompress_size_prepended(src)
-        .map_err(|e| DbError::Corruption(format!("LZ4 decompression failed: {e}")))
+    if src.len() < 4 {
+        return Err(DbError::Corruption("Truncated compressed page data".into()));
+    }
+    let uncomp_size = u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as usize;
+    if uncomp_size > PAGE_SIZE {
+        return Err(DbError::Corruption(format!(
+            "Invalid decompressed size prefix: {uncomp_size} exceeds max PAGE_SIZE ({PAGE_SIZE})"
+        )));
+    }
+
+    let mut dst = alloc::vec![0u8; uncomp_size];
+    let decomp_len = lz4_flex::block::decompress_into(&src[4..], &mut dst)
+        .map_err(|e| DbError::Corruption(format!("LZ4 decompression failed: {e}")))?;
+
+    if decomp_len != uncomp_size {
+        return Err(DbError::Corruption(format!(
+            "LZ4 decompressed size mismatch: expected {uncomp_size}, got {decomp_len}"
+        )));
+    }
+
+    Ok(dst)
 }
 
 /// Transparent per-page LZ4 compression storage wrapper.
 ///
 /// Compresses pages and stores them with an `LZ4P` identifier when compression
-/// succeeds within the page boundary. Incompressible or high-entropy pages automatically
+/// yields meaningful size reduction. Incompressible or high-entropy pages automatically
 /// fall back to raw uncompressed storage without buffer truncation or data loss.
 #[cfg(feature = "compression")]
 #[derive(Debug)]
@@ -53,19 +78,21 @@ impl<S: Storage> Storage for CompressedStorage<S> {
 
         if raw[0..4] == COMPRESSION_MAGIC {
             let comp_len = u16::from_le_bytes([raw[4], raw[5]]) as usize;
-            if comp_len + 6 > PAGE_SIZE {
-                return Err(DbError::Corruption(
-                    "Invalid compressed page length in header".into(),
-                ));
+            if comp_len + 6 <= PAGE_SIZE {
+                if let Ok(decomp) = decompress_page(&raw[6..6 + comp_len]) {
+                    if decomp.len() <= PAGE_SIZE {
+                        buf[..decomp.len()].copy_from_slice(&decomp);
+                        if decomp.len() < PAGE_SIZE {
+                            buf[decomp.len()..].fill(0);
+                        }
+                        return Ok(());
+                    }
+                }
             }
-            let decomp = decompress_page(&raw[6..6 + comp_len])?;
-            let copy_len = decomp.len().min(buf.len());
-            buf[..copy_len].copy_from_slice(&decomp[..copy_len]);
-        } else {
-            // Uncompressed fallback page
-            buf.copy_from_slice(&raw);
         }
 
+        // Uncompressed fallback page or raw data starting with LZ4P
+        buf.copy_from_slice(&raw);
         Ok(())
     }
 
@@ -75,7 +102,7 @@ impl<S: Storage> Storage for CompressedStorage<S> {
         }
 
         let comp = compress_page(buf);
-        if comp.len() + 6 <= PAGE_SIZE {
+        if comp.len() + 6 <= PAGE_SIZE - MIN_COMPRESSION_SAVINGS {
             let mut out = [0u8; PAGE_SIZE];
             out[0..4].copy_from_slice(&COMPRESSION_MAGIC);
             out[4..6].copy_from_slice(&(comp.len() as u16).to_le_bytes());

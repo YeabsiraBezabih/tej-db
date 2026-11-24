@@ -11,9 +11,7 @@ impl<S: Storage> WriteTx<'_, S> {
     pub(crate) fn commit_tables(&mut self) -> Result<()> {
         // 1. Sort and dedup writes for each modified table
         for state in &mut self.table_states {
-            if state.is_sorted {
-                state.pending_writes.dedup_by(|a, b| a.0 == b.0);
-            } else {
+            if !state.is_sorted {
                 state.pending_writes.reverse();
                 state.pending_writes.sort_by(|a, b| a.0.cmp(&b.0));
                 state.pending_writes.dedup_by(|a, b| a.0 == b.0);
@@ -136,9 +134,7 @@ impl<S: Storage> WriteTx<'_, S> {
         if !self.pending_writes.is_empty() {
             let default_guard = self.manager.commit_lock.lock();
             let mut pending = std::mem::take(&mut self.pending_writes);
-            if self.is_sorted {
-                pending.dedup_by(|a, b| a.0 == b.0);
-            } else {
+            if !self.is_sorted {
                 pending.reverse();
                 pending.sort_by(|a, b| a.0.cmp(&b.0));
                 pending.dedup_by(|a, b| a.0 == b.0);
@@ -154,7 +150,9 @@ impl<S: Storage> WriteTx<'_, S> {
             drop(default_guard);
         }
 
-        // 8. Assign commit tx_id and record history
+        // 8. Superblock write and history recording serialized under global commit_lock
+        let commit_guard = self.manager.commit_lock.lock();
+
         let commit_tx = self.manager.next_tx_id.fetch_add(1, Ordering::SeqCst);
         let new_next = commit_tx + 1;
 
@@ -208,7 +206,19 @@ impl<S: Storage> WriteTx<'_, S> {
             }
         }
 
-        // 9. Durability: write MetaPage to alternating superblock and flush
+        // 9. Durability Barrier Phase 1: Flush data pages and sync before superblock update
+        match self.manager.durability() {
+            DurabilityMode::Immediate => {
+                self.manager.cache.flush_data_pages()?;
+                self.manager.cache.sync()?;
+            }
+            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
+                self.manager.cache.flush_data_pages()?;
+            }
+            DurabilityMode::None => {}
+        }
+
+        // Durability Barrier Phase 2: Write MetaPage to alternating superblock, flush, and sync
         if self.manager.durability() != DurabilityMode::None {
             let tables = self.manager.catalog.to_meta_entries();
             let active_root = PageId(self.manager.active_root.load(Ordering::Acquire));
@@ -220,17 +230,24 @@ impl<S: Storage> WriteTx<'_, S> {
             self.manager
                 .active_superblock
                 .store(target_sb.0, Ordering::Release);
+
+            self.manager.cache.flush_page(target_sb)?;
+            if self.manager.durability() == DurabilityMode::Immediate {
+                self.manager.cache.sync()?;
+            }
         }
 
-        match self.manager.durability() {
-            DurabilityMode::Immediate => {
-                self.manager.cache.flush()?;
-            }
-            DurabilityMode::Normal | DurabilityMode::Eventual { .. } => {
-                self.manager.cache.flush_to_storage()?;
-            }
-            DurabilityMode::None => {}
+        // Safe reclamation: free retired pages after superblock sync
+        for pid in self.tx_pages.retired.drain(..) {
+            self.manager.cache.free_page(pid);
         }
+        for state in &mut self.table_states {
+            for pid in state.tx_pages.retired.drain(..) {
+                self.manager.cache.free_page(pid);
+            }
+        }
+
+        drop(commit_guard);
 
         self.committed = true;
 

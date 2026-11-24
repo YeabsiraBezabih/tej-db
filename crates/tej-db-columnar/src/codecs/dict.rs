@@ -61,6 +61,13 @@ impl DictionaryCodec {
         let dict_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4])) as usize;
 
         let mut offset = 8;
+        let max_possible_entries = (bytes.len() - offset) / 2;
+        if dict_size > max_possible_entries {
+            return Err(DbError::Custom(format!(
+                "Dictionary size {dict_size} exceeds maximum possible entries {max_possible_entries}"
+            )));
+        }
+
         let mut dict_entries: Vec<String> = Vec::with_capacity(dict_size);
 
         for _ in 0..dict_size {
@@ -79,7 +86,10 @@ impl DictionaryCodec {
             offset += len;
         }
 
-        if offset + total_rows * 4 > bytes.len() {
+        let needed_code_bytes = total_rows
+            .checked_mul(4)
+            .ok_or_else(|| DbError::Custom("Total rows integer overflow in dictionary".into()))?;
+        if offset + needed_code_bytes > bytes.len() {
             return Err(DbError::Custom("Truncated dictionary code vector".into()));
         }
 

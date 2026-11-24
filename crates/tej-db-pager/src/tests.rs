@@ -124,6 +124,16 @@ fn test_lz4_compression_roundtrip() {
 
 #[cfg(feature = "compression")]
 #[test]
+fn test_lz4_decompression_bomb_rejection() {
+    // 0xFFFF_FFFF prepended length -> 4 GiB allocation attempt
+    let mut bomb = vec![0xFF, 0xFF, 0xFF, 0xFF];
+    bomb.extend_from_slice(&[0x12, 0x34, 0x56]);
+    let res = decompress_page(&bomb);
+    assert!(res.is_err(), "Must reject decompression bomb without OOM");
+}
+
+#[cfg(feature = "compression")]
+#[test]
 fn test_compressed_storage_full_lifecycle() {
     let mem = MemStorage::new();
     let mut storage = CompressedStorage::new(mem);
@@ -164,11 +174,16 @@ fn test_compressed_storage_full_lifecycle() {
 fn test_chacha20_encryption_roundtrip() {
     let key = [0x42u8; 32];
     let nonce = [0x17u8; 12];
+    let aad = b"test_page_aad";
     let secret_data = b"ACID transaction confidential payload";
-    let ciphertext = encrypt_page_data(secret_data, &key, &nonce).unwrap();
+    let ciphertext = encrypt_page_data(secret_data, &key, &nonce, aad).unwrap();
     assert_ne!(ciphertext.as_slice(), secret_data.as_slice());
-    let plaintext = decrypt_page_data(&ciphertext, &key, &nonce).unwrap();
+    let plaintext = decrypt_page_data(&ciphertext, &key, &nonce, aad).unwrap();
     assert_eq!(plaintext.as_slice(), secret_data.as_slice());
+
+    // Tampered AAD fails decryption
+    let tampered_aad = b"wrong_page_aad";
+    assert!(decrypt_page_data(&ciphertext, &key, &nonce, tampered_aad).is_err());
 }
 
 #[cfg(feature = "encryption")]
@@ -224,4 +239,65 @@ fn test_invalid_page_read_error() {
     // Read out of bounds page
     let res = storage.read_page(PageId(9999), &mut buf);
     assert!(res.is_err());
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn test_encrypted_storage_fresh_nonces_and_debug_redacted() {
+    let key = [0x7Bu8; 32];
+    let mem = MemStorage::new();
+    let mut storage = EncryptedStorage::new(mem, key);
+
+    // Verify debug formatting redacts key
+    let debug_str = format!("{storage:?}");
+    assert!(debug_str.contains("[REDACTED]"));
+    assert!(!debug_str.contains("123")); // 0x7B = 123
+
+    let pid = storage.allocate_page().unwrap();
+    let mut page = Page::new(pid, PageType::BTreeLeaf);
+    page.payload_mut()[..10].copy_from_slice(b"version_01");
+    page.update_checksum();
+
+    // First write
+    storage.write_page(pid, page.as_slice()).unwrap();
+    storage.sync().unwrap();
+
+    let mut raw_buf1 = [0u8; PAGE_SIZE];
+    // Read raw physical data page (physical page 1)
+    let raw_inner1 = storage.into_inner();
+    raw_inner1.read_page(PageId(1), &mut raw_buf1).unwrap();
+
+    // Reconstruct storage and write version 2 to same logical page
+    let mut storage = EncryptedStorage::new(raw_inner1, key);
+    page.payload_mut()[..10].copy_from_slice(b"version_02");
+    page.update_checksum();
+    storage.write_page(pid, page.as_slice()).unwrap();
+    storage.sync().unwrap();
+
+    let mut raw_buf2 = [0u8; PAGE_SIZE];
+    let raw_inner2 = storage.into_inner();
+    raw_inner2.read_page(PageId(1), &mut raw_buf2).unwrap();
+
+    // Ciphertexts of subsequent writes must be distinct due to fresh CSPRNG nonce
+    assert_ne!(raw_buf1, raw_buf2);
+}
+
+#[test]
+fn test_file_lock_exclusivity() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("exclusive.db");
+
+    let f1 = FileStorage::open(&file_path).unwrap();
+    // Second handle to the same file should fail with DbError::Locked
+    let f2_res = FileStorage::open(&file_path);
+    assert!(f2_res.is_err(), "Second handle must fail advisory lock");
+    match f2_res.err().unwrap() {
+        tej_db_core::DbError::Locked(_) => {}
+        other => panic!("Expected DbError::Locked, got: {other:?}"),
+    }
+    drop(f1);
+
+    // After drop, opening succeeds
+    let f3 = FileStorage::open(&file_path);
+    assert!(f3.is_ok());
 }

@@ -225,8 +225,7 @@ fn test_sql_transaction_batching_and_plan_cache() {
 
     // 4. Parameterized compiled statement execution
     let stmt = sql
-        .prepare_statement("UPDATE users SET price = ? WHERE id = ?")
-        .or_else(|_| sql.prepare_statement("UPDATE products SET price = ? WHERE id = ?"))
+        .prepare_statement("UPDATE products SET price = ? WHERE id = ?")
         .unwrap();
     let res_prep = stmt
         .execute_in_tx(&mut tx, &[Value::Real(199.99), Value::Integer(2)])
@@ -371,4 +370,58 @@ fn test_schema_row_serialization_fast_path() {
 
     let decoded = schema.decode_row_value(&buf).unwrap();
     assert_eq!(decoded, row, "Direct decoding must match original values!");
+}
+
+#[test]
+fn test_sql_overflow_and_security_panics() {
+    let db = Database::open_memory().unwrap();
+    let sql = SqlEngine::new(&db);
+
+    sql.execute("CREATE TABLE num_test (id INT PRIMARY KEY, val INT)")
+        .unwrap();
+    // -9223372036854775807 fits in i64, then subtracting 1 yields exactly i64::MIN
+    sql.execute("INSERT INTO num_test VALUES (1, -9223372036854775807)")
+        .unwrap();
+
+    // (val - 1) is i64::MIN. (val - 1) / -1 must return error, not crash with SIGFPE
+    let div_overflow = sql.execute("SELECT (val - 1) / -1 FROM num_test WHERE id = 1");
+    assert!(div_overflow.is_err(), "i64::MIN / -1 must return Error");
+
+    // -(i64::MIN) must return error
+    let neg_overflow = sql.execute("SELECT -(val - 1) FROM num_test WHERE id = 1");
+    assert!(neg_overflow.is_err(), "-i64::MIN must return Error");
+
+    // NULL arithmetic propagation
+    sql.execute("CREATE TABLE null_arith (id INT PRIMARY KEY, a INT, b REAL)")
+        .unwrap();
+    sql.execute("INSERT INTO null_arith VALUES (1, NULL, 5.0)")
+        .unwrap();
+    let res_null = sql
+        .execute("SELECT a + 10, a * 2, a / 5 FROM null_arith WHERE id = 1")
+        .unwrap();
+    assert_eq!(res_null.rows[0][0], Value::Null);
+    assert_eq!(res_null.rows[0][1], Value::Null);
+    assert_eq!(res_null.rows[0][2], Value::Null);
+
+    // 3VL: FALSE AND NULL -> FALSE
+    sql.execute("CREATE TABLE logic_test (id INT PRIMARY KEY, flag BOOL)")
+        .unwrap();
+    sql.execute("INSERT INTO logic_test VALUES (1, NULL)")
+        .unwrap();
+    let res_and = sql
+        .execute("SELECT (flag AND FALSE), (flag OR TRUE) FROM logic_test WHERE id = 1")
+        .unwrap();
+    assert_eq!(res_and.rows[0][0], Value::Boolean(false));
+    assert_eq!(res_and.rows[0][1], Value::Boolean(true));
+
+    // Catalog table isolation: writing into default KV does not corrupt SQL table schema
+    let mut write_tx = db.begin_write().unwrap();
+    write_tx
+        .put(b"__sys:schema:num_test", b"malicious_garbage")
+        .unwrap();
+    write_tx.commit().unwrap();
+
+    let check_schema = sql.get_schema("num_test").unwrap();
+    assert!(check_schema.is_some(), "Schema must remain intact");
+    assert_eq!(check_schema.unwrap().name, "num_test");
 }

@@ -7,19 +7,31 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tej_db::{Database, Result, Storage, WriteTx};
 use tej_db_core::DbError;
 
 /// SQL query execution engine operating over a modular ACID database.
-pub struct SqlEngine<'a, S: Storage> {
-    pub(crate) db: &'a Database<S>,
-    pub(crate) schemas: RwLock<HashMap<String, TableSchema>>,
-    plan_cache: RwLock<HashMap<String, Plan>>,
-    pub(crate) auto_rowid: AtomicU64,
+pub struct SqlEngine<S: Storage> {
+    pub(crate) db: Database<S>,
+    pub(crate) schemas: Arc<RwLock<HashMap<String, TableSchema>>>,
+    plan_cache: Arc<RwLock<HashMap<String, Plan>>>,
+    pub(crate) auto_rowid: Arc<AtomicU64>,
 }
 
-impl<S: Storage> fmt::Debug for SqlEngine<'_, S> {
+impl<S: Storage> Clone for SqlEngine<S> {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            schemas: Arc::clone(&self.schemas),
+            plan_cache: Arc::clone(&self.plan_cache),
+            auto_rowid: Arc::clone(&self.auto_rowid),
+        }
+    }
+}
+
+impl<S: Storage> fmt::Debug for SqlEngine<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SqlEngine")
             .field("cached_schemas", &self.schemas.read().len())
@@ -28,14 +40,73 @@ impl<S: Storage> fmt::Debug for SqlEngine<'_, S> {
     }
 }
 
-impl<'a, S: Storage> SqlEngine<'a, S> {
-    pub fn new(db: &'a Database<S>) -> Self {
+impl<S: Storage> SqlEngine<S> {
+    pub fn new(db: &Database<S>) -> Self {
+        let initial_rowid = Self::recover_max_rowid(db);
+        Self {
+            db: db.clone(),
+            schemas: Arc::new(RwLock::new(HashMap::new())),
+            plan_cache: Arc::new(RwLock::new(HashMap::new())),
+            auto_rowid: Arc::new(AtomicU64::new(initial_rowid)),
+        }
+    }
+
+    pub fn from_database(db: Database<S>) -> Self {
+        let initial_rowid = Self::recover_max_rowid(&db);
         Self {
             db,
-            schemas: RwLock::new(HashMap::new()),
-            plan_cache: RwLock::new(HashMap::new()),
-            auto_rowid: AtomicU64::new(1),
+            schemas: Arc::new(RwLock::new(HashMap::new())),
+            plan_cache: Arc::new(RwLock::new(HashMap::new())),
+            auto_rowid: Arc::new(AtomicU64::new(initial_rowid)),
         }
+    }
+
+    pub fn database(&self) -> &Database<S> {
+        &self.db
+    }
+
+    fn recover_max_rowid(db: &Database<S>) -> u64 {
+        let mut max_id = 0u64;
+        let Ok(rx) = db.begin_read() else {
+            return 1;
+        };
+
+        if let Ok(cat_table) = rx.open_table(TableSchema::SQL_CATALOG_TABLE) {
+            if let Ok(Some(bytes)) = cat_table.get(b"__sys:seq:auto_rowid") {
+                if bytes.len() == 8 {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&bytes);
+                    max_id = max_id.max(u64::from_be_bytes(b));
+                }
+            }
+        }
+
+        for table_name in rx.physical_tables() {
+            if table_name.starts_with("__sys:") {
+                continue;
+            }
+            if let Ok(tbl) = rx.open_table(&table_name) {
+                let range = tej_db::KeyRange {
+                    start: std::ops::Bound::Included(vec![0xFE]),
+                    end: std::ops::Bound::Included(vec![
+                        0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    ]),
+                };
+                let _ = tbl.scan_range_visitor(&range, |key, _val| {
+                    if key.len() == 9 && key[0] == 0xFE {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&key[1..9]);
+                        let id = u64::from_be_bytes(b);
+                        if id > max_id {
+                            max_id = id;
+                        }
+                    }
+                    Ok(true)
+                });
+            }
+        }
+
+        max_id.saturating_add(1)
     }
 
     /// Load or retrieve cached table schema from database catalog.
@@ -48,10 +119,22 @@ impl<'a, S: Storage> SqlEngine<'a, S> {
             }
         }
 
-        // Read from DB system catalog
+        // Read from dedicated DB system catalog table
         let rx = self.db.begin_read()?;
         let cat_key = TableSchema::catalog_key(&key_name);
-        if let Some(bytes) = rx.get(&cat_key)? {
+        if let Ok(cat_table) = rx.open_table(TableSchema::SQL_CATALOG_TABLE) {
+            if let Some(bytes) = cat_table.get(&cat_key)? {
+                let schema: TableSchema = bincode::deserialize(&bytes).map_err(|e| {
+                    DbError::Serialization(format!("Catalog schema deserialization failed: {e}"))
+                })?;
+                self.schemas.write().insert(key_name, schema.clone());
+                return Ok(Some(schema));
+            }
+        }
+
+        // Backward-compatible fallback for legacy unisolated schemas
+        let legacy_key = [b"__sys:schema:", key_name.as_bytes()].concat();
+        if let Some(bytes) = rx.get(&legacy_key)? {
             let schema: TableSchema = bincode::deserialize(&bytes).map_err(|e| {
                 DbError::Serialization(format!("Catalog schema deserialization failed: {e}"))
             })?;
@@ -91,7 +174,7 @@ impl<'a, S: Storage> SqlEngine<'a, S> {
     }
 
     /// Compile a parameterized statement with parameter binding slots.
-    pub fn prepare_statement(&'a self, sql: &str) -> Result<PreparedStatement<'a, S>> {
+    pub fn prepare_statement(&self, sql: &str) -> Result<PreparedStatement<S>> {
         let dialect = GenericDialect {};
         let mut ast = Parser::parse_sql(&dialect, sql)
             .map_err(|e| DbError::Custom(format!("SQL parse error: {e}")))?;
@@ -314,7 +397,7 @@ impl<'a, S: Storage> SqlEngine<'a, S> {
             }
         };
 
-        Ok(PreparedStatement::new(self, compiled))
+        Ok(PreparedStatement::new(self.clone(), compiled))
     }
 
     /// Clear the internal statement plan cache.

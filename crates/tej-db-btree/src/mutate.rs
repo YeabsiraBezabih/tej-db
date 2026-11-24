@@ -8,6 +8,9 @@ impl<S: Storage> BTreeIndex<S> {
         val: &[u8],
         tx_pages: &mut TxPageSet,
     ) -> Result<(Vec<PageId>, Option<Vec<u8>>)> {
+        if key.len() > tej_db_core::MAX_KEY_SIZE {
+            return Err(DbError::KeyTooLarge(key.len()));
+        }
         let is_overflow = val.len() > tej_db_core::MAX_INLINE_VAL_SIZE;
         let (_first_overflow_pid, ref_bytes) = if is_overflow {
             let pid = self.write_overflow_chain(val, tx_pages)?;
@@ -40,6 +43,9 @@ impl<S: Storage> BTreeIndex<S> {
         v_raw: u16,
         tx_pages: &mut TxPageSet,
     ) -> Result<(Vec<PageId>, Option<Vec<u8>>)> {
+        if key.len() > tej_db_core::MAX_KEY_SIZE {
+            return Err(DbError::KeyTooLarge(key.len()));
+        }
         let (mut path, bound) = self.find_leaf_path_with_bound(key)?;
         let leaf_id = path
             .pop()
@@ -59,7 +65,7 @@ impl<S: Storage> BTreeIndex<S> {
         if tx_pages.contains(&leaf_id) {
             let old_overflow = self.cache.with_page(leaf_id, free_old_overflow)?;
             if let Some((old_first, total_len)) = old_overflow {
-                self.free_overflow_extent(old_first, total_len);
+                self.retire_overflow_extent(old_first, total_len, tx_pages);
             }
 
             let inserted = self.cache.with_page_mut(leaf_id, |page| {
@@ -88,7 +94,11 @@ impl<S: Storage> BTreeIndex<S> {
 
             if is_append {
                 let mut right = Page::new_leaf(new_right_id, old_leaf.aux_ptr());
-                right.leaf_insert_raw_inplace(key, v_bytes, v_raw)?;
+                if !right.leaf_insert_raw_inplace(key, v_bytes, v_raw)? {
+                    return Err(DbError::CapacityExceeded(
+                        "In-place insert into right leaf failed".into(),
+                    ));
+                }
                 let mid_key = key.to_vec();
 
                 let mut left = old_leaf;
@@ -114,9 +124,15 @@ impl<S: Storage> BTreeIndex<S> {
                 old_leaf.leaf_split_into_at(leaf_id, new_right_id, split_mid)?;
 
             if key < mid_key.as_slice() {
-                left.leaf_insert_raw_inplace(key, v_bytes, v_raw)?;
-            } else {
-                right.leaf_insert_raw_inplace(key, v_bytes, v_raw)?;
+                if !left.leaf_insert_raw_inplace(key, v_bytes, v_raw)? {
+                    return Err(DbError::CapacityExceeded(
+                        "In-place insert into left leaf failed".into(),
+                    ));
+                }
+            } else if !right.leaf_insert_raw_inplace(key, v_bytes, v_raw)? {
+                return Err(DbError::CapacityExceeded(
+                    "In-place insert into right leaf failed".into(),
+                ));
             }
 
             self.cache.write_page(left)?;
@@ -135,7 +151,7 @@ impl<S: Storage> BTreeIndex<S> {
 
         let old_leaf = self.cache.get_page(leaf_id)?;
         if let Some((old_first, total_len)) = free_old_overflow(&old_leaf)? {
-            self.free_overflow_extent(old_first, total_len);
+            self.retire_overflow_extent(old_first, total_len, tx_pages);
         }
 
         if old_leaf.leaf_can_fit(key.len(), v_bytes.len()) {
@@ -145,7 +161,11 @@ impl<S: Storage> BTreeIndex<S> {
             let new_leaf =
                 old_leaf.leaf_create_with_raw_insert(new_leaf_id, key, v_bytes, v_raw)?;
             self.cache.write_page(new_leaf)?;
-            self.cache.free_page(leaf_id);
+            if tx_pages.contains(&leaf_id) {
+                self.cache.free_page(leaf_id);
+            } else {
+                tx_pages.retire(leaf_id);
+            }
 
             let new_root = self.propagate_up_in_tx(path, leaf_id, new_leaf_id, None, tx_pages)?;
             self.set_root_id(new_root);
@@ -175,12 +195,20 @@ impl<S: Storage> BTreeIndex<S> {
             left.update_checksum();
 
             let mut right = Page::new_leaf(new_right_id, old_leaf.aux_ptr());
-            right.leaf_insert_raw_inplace(key, v_bytes, v_raw)?;
+            if !right.leaf_insert_raw_inplace(key, v_bytes, v_raw)? {
+                return Err(DbError::CapacityExceeded(
+                    "In-place insert into right leaf failed".into(),
+                ));
+            }
             let mid_key = key.to_vec();
 
             self.cache.write_page(left)?;
             self.cache.write_page(right)?;
-            self.cache.free_page(leaf_id);
+            if tx_pages.contains(&leaf_id) {
+                self.cache.free_page(leaf_id);
+            } else {
+                tx_pages.retire(leaf_id);
+            }
 
             let new_root = self.propagate_up_in_tx(
                 path,
@@ -198,14 +226,24 @@ impl<S: Storage> BTreeIndex<S> {
             old_leaf.leaf_split_into_at(new_left_id, new_right_id, split_mid)?;
 
         if key < mid_key.as_slice() {
-            left.leaf_insert_raw_inplace(key, v_bytes, v_raw)?;
-        } else {
-            right.leaf_insert_raw_inplace(key, v_bytes, v_raw)?;
+            if !left.leaf_insert_raw_inplace(key, v_bytes, v_raw)? {
+                return Err(DbError::CapacityExceeded(
+                    "In-place insert into left leaf failed".into(),
+                ));
+            }
+        } else if !right.leaf_insert_raw_inplace(key, v_bytes, v_raw)? {
+            return Err(DbError::CapacityExceeded(
+                "In-place insert into right leaf failed".into(),
+            ));
         }
 
         self.cache.write_page(left)?;
         self.cache.write_page(right)?;
-        self.cache.free_page(leaf_id);
+        if tx_pages.contains(&leaf_id) {
+            self.cache.free_page(leaf_id);
+        } else {
+            tx_pages.retire(leaf_id);
+        }
 
         let new_root = self.propagate_up_in_tx(
             path,
@@ -270,9 +308,15 @@ impl<S: Storage> BTreeIndex<S> {
                     old_parent.internal_split_into(parent_id, p_right_id)?;
 
                 if mid_key.as_slice() < p_mid_key.as_slice() {
-                    p_left.internal_insert_inplace(&mid_key, right_child)?;
-                } else {
-                    p_right.internal_insert_inplace(&mid_key, right_child)?;
+                    if !p_left.internal_insert_inplace(&mid_key, right_child)? {
+                        return Err(DbError::CapacityExceeded(
+                            "In-place insert into left internal failed".into(),
+                        ));
+                    }
+                } else if !p_right.internal_insert_inplace(&mid_key, right_child)? {
+                    return Err(DbError::CapacityExceeded(
+                        "In-place insert into right internal failed".into(),
+                    ));
                 }
 
                 self.cache.write_page(p_left)?;
@@ -338,15 +382,12 @@ impl<S: Storage> BTreeIndex<S> {
                 let updated_parent =
                     new_parent.internal_create_with_insert(new_parent_id, &mid_key, right_child)?;
                 self.cache.write_page(updated_parent)?;
-                self.cache.free_page(parent_id);
-                let mut single_tx = TxPageSet::default();
-                return self.propagate_up_in_tx(
-                    path,
-                    parent_id,
-                    new_parent_id,
-                    None,
-                    &mut single_tx,
-                );
+                if tx_pages.contains(&parent_id) {
+                    self.cache.free_page(parent_id);
+                } else {
+                    tx_pages.retire(parent_id);
+                }
+                return self.propagate_up_in_tx(path, parent_id, new_parent_id, None, tx_pages);
             }
 
             let p_left_id = self.cache.allocate_page()?;
@@ -364,8 +405,16 @@ impl<S: Storage> BTreeIndex<S> {
 
             self.cache.write_page(p_left)?;
             self.cache.write_page(p_right)?;
-            self.cache.free_page(parent_id);
-            self.cache.free_page(new_parent_id);
+            if tx_pages.contains(&parent_id) {
+                self.cache.free_page(parent_id);
+            } else {
+                tx_pages.retire(parent_id);
+            }
+            if tx_pages.contains(&new_parent_id) {
+                self.cache.free_page(new_parent_id);
+            } else {
+                tx_pages.retire(new_parent_id);
+            }
 
             return self.propagate_up_in_tx(
                 path,
@@ -377,7 +426,11 @@ impl<S: Storage> BTreeIndex<S> {
         }
 
         self.cache.write_page(new_parent)?;
-        self.cache.free_page(parent_id);
+        if tx_pages.contains(&parent_id) {
+            self.cache.free_page(parent_id);
+        } else {
+            tx_pages.retire(parent_id);
+        }
         self.propagate_up_in_tx(path, parent_id, new_parent_id, None, tx_pages)
     }
 

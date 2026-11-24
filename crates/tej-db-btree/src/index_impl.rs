@@ -11,6 +11,9 @@ impl<S: Storage> Index for BTreeIndex<S> {
     fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         let mut tx_pages = TxPageSet::default();
         let _ = self.insert_in_tx(key, val, &mut tx_pages)?;
+        for pid in tx_pages.retired {
+            self.cache.free_page(pid);
+        }
         Ok(())
     }
 

@@ -6,6 +6,7 @@ pub mod executor;
 pub mod expr;
 pub mod fts;
 pub mod hybrid;
+pub mod param_subst;
 pub mod plan;
 pub mod plan_ddl;
 pub mod plan_dml;

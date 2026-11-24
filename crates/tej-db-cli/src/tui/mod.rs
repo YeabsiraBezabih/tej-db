@@ -6,10 +6,11 @@
     clippy::needless_pass_by_value
 )]
 
+mod events;
 mod render;
+
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -17,7 +18,7 @@ use ratatui::{Terminal, backend::CrosstermBackend, style::Color, widgets::ListSt
 use std::io::stdout;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tej_db::{Database, FileStorage, KeyRange};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub struct App {
     pub status_time: Instant,
 
     // Explorer state
+    pub current_table: Option<String>,
     pub keys: Vec<(Vec<u8>, usize)>,
     pub list_state: ListState,
     pub selected_value: Option<Vec<u8>>,
@@ -56,6 +58,7 @@ impl App {
             status_message:
                 "Welcome to TejDb Interactive Shell. Press Tab to switch views, 'q' to quit.".into(),
             status_time: Instant::now(),
+            current_table: None,
             keys: Vec::new(),
             list_state: ListState::default(),
             selected_value: None,
@@ -75,9 +78,39 @@ impl App {
         Ok(app)
     }
 
+    pub fn current_table_name(&self) -> &str {
+        self.current_table.as_deref().unwrap_or("default")
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = msg.into();
         self.status_time = Instant::now();
+    }
+
+    pub fn next_table(&mut self) {
+        let tables = self.db.list_tables().unwrap_or_default();
+        if tables.is_empty() {
+            self.current_table = None;
+            return;
+        }
+
+        self.current_table = match &self.current_table {
+            None => Some(tables[0].clone()),
+            Some(cur) => {
+                if let Some(pos) = tables.iter().position(|t| t == cur) {
+                    if pos + 1 < tables.len() {
+                        Some(tables[pos + 1].clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
+
+        self.list_state.select(None);
+        self.reload_keys();
     }
 
     pub fn reload_keys(&mut self) {
@@ -86,16 +119,23 @@ impl App {
                 start: Bound::Unbounded,
                 end: Bound::Unbounded,
             };
-            if let Ok(items) = rx.scan_range(&range) {
-                self.keys = items
-                    .into_iter()
-                    .map(|item| (item.key, item.value.len()))
-                    .collect();
-                if !self.keys.is_empty() && self.list_state.selected().is_none() {
-                    self.list_state.select(Some(0));
-                }
-                self.update_selected_value();
+
+            let items = if let Some(ref tbl) = self.current_table {
+                rx.open_table(tbl)
+                    .and_then(|t| t.scan_range(&range))
+                    .unwrap_or_default()
+            } else {
+                rx.scan_range(&range).unwrap_or_default()
+            };
+
+            self.keys = items
+                .into_iter()
+                .map(|item| (item.key, item.value.len()))
+                .collect();
+            if !self.keys.is_empty() && self.list_state.selected().is_none() {
+                self.list_state.select(Some(0));
             }
+            self.update_selected_value();
         }
     }
 
@@ -103,10 +143,13 @@ impl App {
         if let Some(idx) = self.list_state.selected() {
             if let Some((k, _)) = self.keys.get(idx) {
                 if let Ok(rx) = self.db.begin_read() {
-                    if let Ok(val) = rx.get(k) {
-                        self.selected_value = val;
-                        return;
-                    }
+                    let val = if let Some(ref tbl) = self.current_table {
+                        rx.open_table(tbl).and_then(|t| t.get(k)).ok().flatten()
+                    } else {
+                        rx.get(k).ok().flatten()
+                    };
+                    self.selected_value = val;
+                    return;
                 }
             }
         }
@@ -165,9 +208,8 @@ impl App {
                 let stats = self.db.stats();
                 self.console_history.push((
                     format!(
-                        "Cached: {}/{} | Hits: {} | Misses: {} | Active Readers: {}",
+                        "Cached: {} | Hits: {} | Misses: {} | Active Readers: {}",
                         stats.cached_pages,
-                        1024,
                         stats.cache_hits,
                         stats.cache_misses,
                         stats.active_read_txns
@@ -182,22 +224,29 @@ impl App {
                 } else {
                     let k = tokens[1].as_bytes();
                     match self.db.begin_read() {
-                        Ok(rx) => match rx.get(k) {
-                            Ok(Some(val)) => {
-                                let s = String::from_utf8_lossy(&val);
-                                self.console_history.push((
-                                    format!("Val (len {}): \"{}\"", val.len(), s),
-                                    Color::Green,
-                                ));
+                        Ok(rx) => {
+                            let val = if let Some(ref tbl) = self.current_table {
+                                rx.open_table(tbl).and_then(|t| t.get(k))
+                            } else {
+                                rx.get(k)
+                            };
+                            match val {
+                                Ok(Some(v)) => {
+                                    let s = String::from_utf8_lossy(&v);
+                                    self.console_history.push((
+                                        format!("Val (len {}): \"{}\"", v.len(), s),
+                                        Color::Green,
+                                    ));
+                                }
+                                Ok(None) => {
+                                    self.console_history
+                                        .push(("Key not found".into(), Color::Yellow));
+                                }
+                                Err(e) => self
+                                    .console_history
+                                    .push((format!("Error: {e}"), Color::Red)),
                             }
-                            Ok(None) => {
-                                self.console_history
-                                    .push(("Key not found".into(), Color::Yellow));
-                            }
-                            Err(e) => self
-                                .console_history
-                                .push((format!("Error: {e}"), Color::Red)),
-                        },
+                        }
                         Err(e) => self
                             .console_history
                             .push((format!("Error: {e}"), Color::Red)),
@@ -214,7 +263,12 @@ impl App {
                     let start = Instant::now();
                     let put_result = (|| -> Result<(), tej_db::DbError> {
                         let mut tx = self.db.begin_write()?;
-                        tx.put(k, &v)?;
+                        if let Some(ref tbl) = self.current_table {
+                            let mut t = tx.open_table_mut(tbl)?;
+                            t.put(k, &v)?;
+                        } else {
+                            tx.put(k, &v)?;
+                        }
                         tx.commit()?;
                         Ok(())
                     })();
@@ -240,7 +294,12 @@ impl App {
                     let k = tokens[1].as_bytes();
                     let del_result = (|| -> Result<bool, tej_db::DbError> {
                         let mut tx = self.db.begin_write()?;
-                        let deleted = tx.delete(k)?;
+                        let deleted = if let Some(ref tbl) = self.current_table {
+                            let mut t = tx.open_table_mut(tbl)?;
+                            t.delete(k)?
+                        } else {
+                            tx.delete(k)?
+                        };
                         tx.commit()?;
                         Ok(deleted)
                     })();
@@ -268,10 +327,19 @@ impl App {
                         start: Bound::Unbounded,
                         end: Bound::Unbounded,
                     };
-                    match rx.scan_range(&range) {
+                    let items_res = if let Some(ref tbl) = self.current_table {
+                        rx.open_table(tbl).and_then(|t| t.scan_range(&range))
+                    } else {
+                        rx.scan_range(&range)
+                    };
+                    match items_res {
                         Ok(items) => {
                             self.console_history.push((
-                                format!("Total entries found: {}", items.len()),
+                                format!(
+                                    "Total entries in [{}]: {}",
+                                    self.current_table_name(),
+                                    items.len()
+                                ),
                                 Color::Yellow,
                             ));
                             for item in items.iter().take(10) {
@@ -279,12 +347,6 @@ impl App {
                                 let v = String::from_utf8_lossy(&item.value);
                                 self.console_history
                                     .push((format!("  {k} -> {v}"), Color::DarkGray));
-                            }
-                            if items.len() > 10 {
-                                self.console_history.push((
-                                    format!("  ... and {} more entries", items.len() - 10),
-                                    Color::DarkGray,
-                                ));
                             }
                         }
                         Err(e) => self
@@ -315,108 +377,11 @@ pub fn run_tui(db_path: &Path) -> Result<()> {
 
     let mut app = App::new(db_path.to_path_buf())?;
 
-    let res = run_loop(&mut terminal, &mut app);
+    let res = events::run_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     res
-}
-
-fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    loop {
-        terminal.draw(|f| render::ui(f, app))?;
-
-        if event::poll(Duration::from_millis(100))? {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind == KeyEventKind::Press {
-                    match app.current_tab {
-                        ActiveTab::Console => match key.code {
-                            KeyCode::Esc => app.should_quit = true,
-                            KeyCode::Tab => app.next_tab(),
-                            KeyCode::BackTab => app.prev_tab(),
-                            KeyCode::Enter => app.execute_console_command(),
-                            KeyCode::Backspace => {
-                                app.console_input.pop();
-                            }
-                            KeyCode::Char(c) => {
-                                app.console_input.push(c);
-                            }
-                            _ => {}
-                        },
-                        _ => match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-                            KeyCode::Tab => app.next_tab(),
-                            KeyCode::BackTab => app.prev_tab(),
-                            KeyCode::Char('1') => app.current_tab = ActiveTab::Dashboard,
-                            KeyCode::Char('2') => app.current_tab = ActiveTab::Explorer,
-                            KeyCode::Char('3') => app.current_tab = ActiveTab::Console,
-                            KeyCode::Char('r') => {
-                                app.reload_keys();
-                                app.set_status("Reloaded key store.");
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                if !app.keys.is_empty() {
-                                    let i = match app.list_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                app.keys.len() - 1
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    app.list_state.select(Some(i));
-                                    app.update_selected_value();
-                                }
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if !app.keys.is_empty() {
-                                    let i = match app.list_state.selected() {
-                                        Some(i) => {
-                                            if i >= app.keys.len() - 1 {
-                                                0
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    app.list_state.select(Some(i));
-                                    app.update_selected_value();
-                                }
-                            }
-                            KeyCode::Char('d') => {
-                                if let Some(idx) = app.list_state.selected() {
-                                    if let Some((k, _)) = app.keys.get(idx).cloned() {
-                                        let del_res = (|| -> Result<(), tej_db::DbError> {
-                                            let mut tx = app.db.begin_write()?;
-                                            tx.delete(&k)?;
-                                            tx.commit()?;
-                                            Ok(())
-                                        })();
-                                        if del_res.is_ok() {
-                                            app.reload_keys();
-                                            app.set_status(format!(
-                                                "Deleted key '{}'",
-                                                String::from_utf8_lossy(&k)
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
-                        },
-                    }
-                }
-            }
-        }
-
-        if app.should_quit {
-            break;
-        }
-    }
-    Ok(())
 }

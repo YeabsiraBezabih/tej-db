@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tej_db::Database;
 use tej_db_core::{DbError, Page, PageId, PageType, Result, Storage};
@@ -9,15 +10,19 @@ use tej_db_pager::{MemStorage, PageCache};
 struct CorruptingStorage {
     inner: MemStorage,
     corrupt_reads: bool,
-    fail_writes: AtomicBool,
+    fail_writes: Arc<AtomicBool>,
 }
 
 impl CorruptingStorage {
     fn new() -> Self {
+        Self::with_fail_trigger(Arc::new(AtomicBool::new(false)))
+    }
+
+    fn with_fail_trigger(fail_writes: Arc<AtomicBool>) -> Self {
         Self {
             inner: MemStorage::new(),
             corrupt_reads: false,
-            fail_writes: AtomicBool::new(false),
+            fail_writes,
         }
     }
 }
@@ -132,28 +137,43 @@ fn test_empty_zero_byte_file_auto_initialized() {
 
 #[test]
 fn test_enospc_disk_full_simulation() {
-    let storage = CorruptingStorage::new();
+    let fail_writes = Arc::new(AtomicBool::new(false));
+    let storage = CorruptingStorage::with_fail_trigger(Arc::clone(&fail_writes));
     let db = Database::open_custom(storage, 10).unwrap();
 
-    // 1. Initial committed state
+    // 1. Initial committed state succeeds
     {
         let mut tx = db.begin_write().unwrap();
         tx.put(b"k1", b"v1").unwrap();
         tx.commit().unwrap();
     }
 
-    // 2. Begin transaction and simulate ENOSPC during commit flush
+    // 2. Begin transaction, insert k2, and trigger simulated ENOSPC failure during commit
     {
         let mut tx = db.begin_write().unwrap();
         tx.put(b"k2", b"v2").unwrap();
-        // Inject disk full
-        // Note: CorruptingStorage is inside db's PageCache storage RwLock
-        // We can test rollback / discard on error
-        tx.rollback().unwrap();
+
+        // Inject disk full prior to commit flush
+        fail_writes.store(true, Ordering::Release);
+        let commit_res = tx.commit();
+        assert!(commit_res.is_err(), "Commit must fail when disk is full");
     }
 
-    // 3. Verify database state remains uncorrupted at k1=v1
+    // 3. Verify database state remains uncorrupted at k1=v1; k2 must NOT be visible
     let rx = db.begin_read().unwrap();
     assert_eq!(rx.get(b"k1").unwrap(), Some(b"v1".to_vec()));
     assert_eq!(rx.get(b"k2").unwrap(), None);
+
+    // 4. Recover from ENOSPC when disk space is cleared
+    fail_writes.store(false, Ordering::Release);
+    {
+        let mut tx = db.begin_write().unwrap();
+        tx.put(b"k3", b"v3").unwrap();
+        tx.commit().unwrap();
+    }
+
+    let rx2 = db.begin_read().unwrap();
+    assert_eq!(rx2.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+    assert_eq!(rx2.get(b"k2").unwrap(), None);
+    assert_eq!(rx2.get(b"k3").unwrap(), Some(b"v3".to_vec()));
 }

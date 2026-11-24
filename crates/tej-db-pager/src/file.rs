@@ -22,6 +22,8 @@ impl FileStorage {
             .truncate(false)
             .open(&path)?;
 
+        crate::lock::FileLock::try_lock_exclusive(&file)?;
+
         let len = file.seek(SeekFrom::End(0))?;
         if len > 0 && len % PAGE_SIZE as u64 != 0 {
             return Err(DbError::Corruption(format!(
@@ -54,15 +56,10 @@ impl Storage for FileStorage {
 
         let offset = id.0 * PAGE_SIZE as u64;
         let file_len = self.file.metadata().map_or(0, |m| m.len());
-        if offset >= file_len {
-            buf.fill(0);
-            return Ok(());
-        }
         if offset + PAGE_SIZE as u64 > file_len {
-            let to_read = (file_len - offset) as usize;
-            self.file.read_exact_at(&mut buf[..to_read], offset)?;
-            buf[to_read..].fill(0);
-            return Ok(());
+            return Err(DbError::Corruption(format!(
+                "Unexpected EOF reading page {id}: offset {offset} + {PAGE_SIZE} exceeds file size {file_len}"
+            )));
         }
         self.file.read_exact_at(buf, offset)?;
         Ok(())
@@ -134,6 +131,13 @@ impl Storage for FileStorage {
         } else {
             data.len().div_ceil(PAGE_SIZE) as u64
         };
+        let target_len = (start_id.0 + num_pages) * PAGE_SIZE as u64;
+        let written_end = offset + data.len() as u64;
+        if written_end < target_len {
+            let padding_len = (target_len - written_end) as usize;
+            let padding = vec![0u8; padding_len];
+            self.file.write_all_at(&padding, written_end)?;
+        }
         let end_page = start_id.0 + num_pages;
         if end_page > self.page_count {
             self.page_count = end_page;
@@ -185,7 +189,7 @@ impl Storage for FileStorage {
         let id = PageId(self.page_count);
         self.page_count += 1;
         let new_len = self.page_count * PAGE_SIZE as u64;
-        let _ = self.file.set_len(new_len);
+        self.file.set_len(new_len).map_err(DbError::Io)?;
         Ok(id)
     }
 

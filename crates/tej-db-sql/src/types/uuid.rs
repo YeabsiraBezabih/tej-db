@@ -39,10 +39,9 @@ impl FromStr for Uuid {
 
     fn from_str(s: &str) -> Result<Self> {
         let cleaned: String = s.chars().filter(|&c| c != '-').collect();
-        if cleaned.len() != 32 {
+        if cleaned.len() != 32 || !cleaned.is_ascii() {
             return Err(DbError::Custom(format!(
-                "Invalid UUID length: expected 32 hex characters, got {}",
-                cleaned.len()
+                "Invalid UUID: expected 32 ASCII hex characters, got '{cleaned}'"
             )));
         }
 

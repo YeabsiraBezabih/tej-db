@@ -117,23 +117,12 @@ pub trait Storage: Send + Sync + 'static {
         }
 
         let extent_len = num_pages * crate::PAGE_SIZE;
-        let mut extent_buf = Vec::with_capacity(extent_len);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            extent_buf.set_len(extent_len);
-        }
+        let mut extent_buf = vec![0u8; extent_len];
 
         for (i, chunk) in data.chunks(crate::PAGE_SIZE).enumerate() {
             let page_offset = i * crate::PAGE_SIZE;
             let page_buf = &mut extent_buf[page_offset..page_offset + crate::PAGE_SIZE];
             page_buf[..chunk.len()].copy_from_slice(chunk);
-            if chunk.len() < crate::PAGE_SIZE {
-                page_buf[chunk.len()..].fill(0);
-            }
-        }
-        if data.is_empty() {
-            let page_buf = &mut extent_buf[0..crate::PAGE_SIZE];
-            page_buf.fill(0);
         }
 
         self.write_pages(start_id, &extent_buf)

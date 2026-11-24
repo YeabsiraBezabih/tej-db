@@ -1,3 +1,4 @@
+use crate::bounds::{max_start_bound, min_end_bound};
 use crate::plan_ddl::plan_create_table;
 use crate::plan_dml::{map_returning, plan_insert};
 use crate::schema::{SqlType, TableSchema};
@@ -274,74 +275,6 @@ fn extract_pk_equality(expr: &SqlExpr, pk_col: &str) -> Option<Value> {
     None
 }
 
-fn max_start_bound(b1: Bound<Vec<u8>>, b2: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
-    match (b1, b2) {
-        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
-        (Bound::Included(k1), Bound::Included(k2)) => {
-            if k1 >= k2 {
-                Bound::Included(k1)
-            } else {
-                Bound::Included(k2)
-            }
-        }
-        (Bound::Excluded(k1), Bound::Excluded(k2)) => {
-            if k1 >= k2 {
-                Bound::Excluded(k1)
-            } else {
-                Bound::Excluded(k2)
-            }
-        }
-        (Bound::Included(k1), Bound::Excluded(k2)) => {
-            if k1 > k2 {
-                Bound::Included(k1)
-            } else {
-                Bound::Excluded(k2)
-            }
-        }
-        (Bound::Excluded(k1), Bound::Included(k2)) => {
-            if k1 >= k2 {
-                Bound::Excluded(k1)
-            } else {
-                Bound::Included(k2)
-            }
-        }
-    }
-}
-
-fn min_end_bound(b1: Bound<Vec<u8>>, b2: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
-    match (b1, b2) {
-        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
-        (Bound::Included(k1), Bound::Included(k2)) => {
-            if k1 <= k2 {
-                Bound::Included(k1)
-            } else {
-                Bound::Included(k2)
-            }
-        }
-        (Bound::Excluded(k1), Bound::Excluded(k2)) => {
-            if k1 <= k2 {
-                Bound::Excluded(k1)
-            } else {
-                Bound::Excluded(k2)
-            }
-        }
-        (Bound::Included(k1), Bound::Excluded(k2)) => {
-            if k1 < k2 {
-                Bound::Included(k1)
-            } else {
-                Bound::Excluded(k2)
-            }
-        }
-        (Bound::Excluded(k1), Bound::Included(k2)) => {
-            if k1 <= k2 {
-                Bound::Excluded(k1)
-            } else {
-                Bound::Included(k2)
-            }
-        }
-    }
-}
-
 #[allow(clippy::type_complexity, clippy::single_match)]
 fn extract_pk_range(
     expr: &SqlExpr,
@@ -372,6 +305,38 @@ fn extract_pk_range(
                         }
                         BinaryOperator::LtEq => {
                             return Some((Bound::Unbounded, Bound::Included(enc), None));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let (SqlExpr::Value(v), SqlExpr::Identifier(id)) = (left.as_ref(), right.as_ref()) {
+                if id.value.eq_ignore_ascii_case(pk_col) {
+                    let val = parse_sql_value(v)?;
+                    if val.is_null() {
+                        return Some((
+                            Bound::Excluded(Vec::new()),
+                            Bound::Included(Vec::new()),
+                            None,
+                        ));
+                    }
+                    let enc = val.encode_key();
+                    match op {
+                        BinaryOperator::Gt => {
+                            // v > id  <=>  id < v
+                            return Some((Bound::Unbounded, Bound::Excluded(enc), None));
+                        }
+                        BinaryOperator::GtEq => {
+                            // v >= id  <=>  id <= v
+                            return Some((Bound::Unbounded, Bound::Included(enc), None));
+                        }
+                        BinaryOperator::Lt => {
+                            // v < id  <=>  id > v
+                            return Some((Bound::Excluded(enc), Bound::Unbounded, None));
+                        }
+                        BinaryOperator::LtEq => {
+                            // v <= id  <=>  id >= v
+                            return Some((Bound::Included(enc), Bound::Unbounded, None));
                         }
                         _ => {}
                     }

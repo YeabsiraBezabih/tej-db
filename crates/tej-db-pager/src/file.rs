@@ -84,9 +84,11 @@ impl Storage for FileStorage {
             return Ok(false);
         }
         let offset = start_id.0 * PAGE_SIZE as u64;
-        if self.file.read_exact_at(out, offset).is_err() {
+        let file_bytes = self.page_count * PAGE_SIZE as u64;
+        if offset + out.len() as u64 > file_bytes {
             return Ok(false);
         }
+        self.file.read_exact_at(out, offset)?;
         Ok(true)
     }
 
@@ -104,19 +106,17 @@ impl Storage for FileStorage {
             return Ok(None);
         }
         let offset = start_id.0 * PAGE_SIZE as u64;
+        let file_bytes = self.page_count * PAGE_SIZE as u64;
+        if offset + total_len as u64 > file_bytes {
+            return Ok(None);
+        }
 
         SCRATCH_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             if buf.len() < total_len {
                 buf.resize(total_len, 0);
             }
-            if self
-                .file
-                .read_exact_at(&mut buf[..total_len], offset)
-                .is_err()
-            {
-                return Ok(None);
-            }
+            self.file.read_exact_at(&mut buf[..total_len], offset)?;
             let res = f(&buf[..total_len])?;
             Ok(Some(res))
         })

@@ -1,3 +1,4 @@
+pub mod bounds;
 pub mod cbo;
 pub mod constraint;
 pub mod constraint_eval;

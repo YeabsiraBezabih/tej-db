@@ -104,10 +104,6 @@ impl<S: Storage> VamanaSearcher<S> {
                     Err(_) => continue,
                 };
 
-                if neighbor_node.metadata.is_deleted {
-                    continue;
-                }
-
                 let dist = self.quantizer.estimate_l2_distance(
                     &rot_query,
                     q_norm_sq,
@@ -123,9 +119,13 @@ impl<S: Storage> VamanaSearcher<S> {
                     distance: dist,
                 };
 
+                // Traverse through candidates even if deleted to preserve graph reachability
                 candidates.push(std::cmp::Reverse(cand));
 
-                if predicate_filter.is_none_or(|f| f(cand.vector_id)) {
+                // Only consider live non-deleted nodes matching predicate filter for top_k results
+                if !neighbor_node.metadata.is_deleted
+                    && predicate_filter.is_none_or(|f| f(cand.vector_id))
+                {
                     top_k.push(cand);
                     if top_k.len() > beam_width {
                         top_k.pop();

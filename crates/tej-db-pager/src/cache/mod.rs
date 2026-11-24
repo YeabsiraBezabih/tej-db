@@ -161,6 +161,7 @@ impl<S: Storage> PageCache<S> {
             CacheEntry {
                 page: page.clone(),
                 is_dirty: false,
+                dirty_seq: 0,
                 referenced: AtomicBool::new(false),
             },
         );
@@ -210,6 +211,7 @@ impl<S: Storage> PageCache<S> {
             CacheEntry {
                 page,
                 is_dirty: false,
+                dirty_seq: 0,
                 referenced: AtomicBool::new(false),
             },
         );
@@ -237,6 +239,7 @@ impl<S: Storage> PageCache<S> {
                 self.dirty_shard_mask
                     .fetch_or(1 << s_idx, Ordering::Relaxed);
             }
+            entry.dirty_seq = entry.dirty_seq.wrapping_add(1);
             entry.referenced.store(true, Ordering::Relaxed);
             return f(&mut entry.page);
         }
@@ -269,6 +272,7 @@ impl<S: Storage> PageCache<S> {
                     self.dirty_shard_mask
                         .fetch_or(1 << s_idx, Ordering::Relaxed);
                 }
+                entry.dirty_seq = entry.dirty_seq.wrapping_add(1);
                 entry.referenced.store(true, Ordering::Relaxed);
                 return Ok(());
             }
@@ -281,6 +285,7 @@ impl<S: Storage> PageCache<S> {
             CacheEntry {
                 page,
                 is_dirty: true,
+                dirty_seq: 1,
                 referenced: AtomicBool::new(false),
             },
         );
@@ -330,6 +335,7 @@ impl<S: Storage> PageCache<S> {
                         entry.is_dirty = true;
                         dirty_pages.push(id);
                     }
+                    entry.dirty_seq = entry.dirty_seq.wrapping_add(1);
                     entry.referenced.store(true, Ordering::Relaxed);
                 } else {
                     entries.insert(
@@ -337,6 +343,7 @@ impl<S: Storage> PageCache<S> {
                         CacheEntry {
                             page,
                             is_dirty: true,
+                            dirty_seq: 1,
                             referenced: AtomicBool::new(false),
                         },
                     );

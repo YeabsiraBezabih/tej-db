@@ -45,11 +45,21 @@ pub fn decrypt_page_data(
 
 #[inline]
 fn logical_to_physical_ids(logical_id: PageId) -> (PageId, PageId, usize) {
-    let group = logical_id.0 / TAGS_PER_PAGE;
-    let offset_in_group = (logical_id.0 % TAGS_PER_PAGE) as usize;
-    let tag_pid = PageId(group * STRIDE);
-    let data_pid = PageId(group * STRIDE + 1 + offset_in_group as u64);
-    (tag_pid, data_pid, offset_in_group)
+    if logical_id.0 == 0 {
+        // Superblock 0: dedicated tag Page 0 and ciphertext data Page 1
+        (PageId(0), PageId(1), 0)
+    } else if logical_id.0 == 1 {
+        // Superblock 1: dedicated tag Page 2 and ciphertext data Page 3 (physically isolated from SB0)
+        (PageId(2), PageId(3), 0)
+    } else {
+        // Regular data pages start at physical base 4
+        let rel_id = logical_id.0 - 2;
+        let group = rel_id / TAGS_PER_PAGE;
+        let offset_in_group = (rel_id % TAGS_PER_PAGE) as usize;
+        let tag_pid = PageId(4 + group * STRIDE);
+        let data_pid = PageId(4 + group * STRIDE + 1 + offset_in_group as u64);
+        (tag_pid, data_pid, offset_in_group)
+    }
 }
 
 /// Generate a fresh cryptographically secure random 96-bit nonce.
@@ -245,14 +255,18 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     fn page_count(&self) -> u64 {
         let total_physical = self.inner.page_count();
-        if total_physical == 0 {
+        if total_physical < 2 {
             return 0;
         }
+        if total_physical < 4 {
+            return 1;
+        }
 
-        let full_groups = total_physical / STRIDE;
-        let rem = total_physical % STRIDE;
+        let regular_physical = total_physical - 4;
+        let full_groups = regular_physical / STRIDE;
+        let rem = regular_physical % STRIDE;
         let data_in_rem = rem.saturating_sub(1);
-        full_groups * TAGS_PER_PAGE + data_in_rem
+        2 + full_groups * TAGS_PER_PAGE + data_in_rem
     }
 
     fn allocate_page(&mut self) -> Result<PageId> {

@@ -10,7 +10,9 @@ use tej_db_sql::SqlEngine;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
+pub mod models;
 pub mod routes;
+pub use models::*;
 pub use routes::*;
 
 /// Shared Application State wrapping the embedded DBMS engine

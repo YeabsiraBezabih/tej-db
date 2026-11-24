@@ -78,7 +78,13 @@ impl std::fmt::Display for FfiError {
 
 impl From<DbError> for FfiError {
     fn from(err: DbError) -> Self {
-        Self::Database(err)
+        match err {
+            DbError::WriteConflict { committed_tx, .. } => Self::Conflict(format!(
+                "Write-write conflict with committed tx {committed_tx}"
+            )),
+            DbError::Concurrency(msg) => Self::Conflict(msg),
+            _ => Self::Database(err),
+        }
     }
 }
 

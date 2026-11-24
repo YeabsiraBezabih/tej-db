@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod catalog_tree;
+pub mod cohort;
 pub mod commit;
 pub mod conflict;
 pub mod manager;

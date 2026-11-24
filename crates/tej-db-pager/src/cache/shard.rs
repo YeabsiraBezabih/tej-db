@@ -7,6 +7,7 @@ use tej_db_core::{Page, PageId};
 pub(crate) struct CacheEntry {
     pub(crate) page: Page,
     pub(crate) is_dirty: bool,
+    pub(crate) dirty_seq: u64,
     pub(crate) referenced: AtomicBool,
 }
 

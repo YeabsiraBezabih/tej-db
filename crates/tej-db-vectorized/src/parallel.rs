@@ -22,7 +22,12 @@ pub fn parallel_scan_and_filter(
     if total_rgs == 0 {
         return Ok(0);
     }
-    let rows_per_rg = row_groups[0].metadata.num_rows as usize;
+    let rows_per_rg = row_groups
+        .iter()
+        .map(|rg| rg.metadata.num_rows as usize)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let scheduler = Arc::new(MorselScheduler::new(total_rgs, rows_per_rg, rows_per_rg));
     let num_threads = num_threads.max(1);
 
@@ -158,7 +163,12 @@ pub fn parallel_hash_aggregate(
     if total_rgs == 0 {
         return Ok(DataChunk::new(&[], 0));
     }
-    let rows_per_rg = row_groups[0].metadata.num_rows as usize;
+    let rows_per_rg = row_groups
+        .iter()
+        .map(|rg| rg.metadata.num_rows as usize)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let scheduler = Arc::new(MorselScheduler::new(total_rgs, rows_per_rg, rows_per_rg));
     let num_threads = num_threads.max(1);
 
@@ -301,8 +311,11 @@ pub fn parallel_hash_aggregate(
     // Build output chunk: [group_col, agg_0, agg_1, ...]
     let mut out_types = Vec::with_capacity(1 + aggregates.len());
     out_types.push(PhysicalType::Int64);
-    for _ in aggregates {
-        out_types.push(PhysicalType::Int64);
+    for &(_, func) in aggregates {
+        match func {
+            AggregateFunction::AvgFloat64 => out_types.push(PhysicalType::Float64),
+            _ => out_types.push(PhysicalType::Int64),
+        }
     }
 
     let mut out_chunk = DataChunk::new(&out_types, final_groups.len());
@@ -320,14 +333,14 @@ pub fn parallel_hash_aggregate(
                 ThreadAggState::Count(c) => col.push_i64(*c as i64)?,
                 ThreadAggState::SumInt64(s) => col.push_i64(*s)?,
                 ThreadAggState::MinInt64(m) | ThreadAggState::MaxInt64(m) => col.push_i64(*m)?,
+                #[allow(clippy::cast_precision_loss)]
                 ThreadAggState::AvgFloat64 { sum, count } => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
                     let avg = if *count > 0 {
-                        (*sum / (*count as f64)) as i64
+                        *sum / (*count as f64)
                     } else {
-                        0
+                        0.0
                     };
-                    col.push_i64(avg)?;
+                    col.push_f64(avg)?;
                 }
             }
         }
@@ -348,7 +361,12 @@ pub fn parallel_tpch_q6(
     if total_rgs == 0 {
         return Ok((0, 0));
     }
-    let rows_per_rg = row_groups[0].metadata.num_rows as usize;
+    let rows_per_rg = row_groups
+        .iter()
+        .map(|rg| rg.metadata.num_rows as usize)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let scheduler = Arc::new(MorselScheduler::new(total_rgs, rows_per_rg, rows_per_rg));
     let num_threads = num_threads.max(1);
 

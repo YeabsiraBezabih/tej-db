@@ -42,7 +42,7 @@ impl<S: Storage> WriteTx<'_, S> {
         let leader_keys: Arc<[tej_db_btree::InlineKey]> =
             pending.iter().map(|item| item.0.clone()).collect();
         let leader_commit_tx = cur_next;
-        let mut next_assign_tx = leader_commit_tx + 1;
+        let next_assign_tx = leader_commit_tx + 1;
 
         let mut scan_tail = cur_tail;
         let mut cohort_tickets: SmallVec<[u64; 64]> = SmallVec::new();
@@ -164,30 +164,7 @@ impl<S: Storage> WriteTx<'_, S> {
         }
 
         let new_root = target_btree.root_id();
-
-        let mut committed_slots = Vec::with_capacity(approved_records.len());
-        {
-            let mut history = self.manager.commit_history.write();
-            history.push_back(CommittedTxRecord {
-                tx_id: TxId(leader_commit_tx),
-                tables: self.modified_tables.clone(),
-                keys: leader_keys,
-            });
-
-            for (ticket, tables, keys) in approved_records {
-                let commit_tx = next_assign_tx;
-                next_assign_tx += 1;
-                history.push_back(CommittedTxRecord {
-                    tx_id: TxId(commit_tx),
-                    tables,
-                    keys,
-                });
-                committed_slots.push((ticket, commit_tx));
-            }
-            while history.len() > 2048 {
-                history.pop_front();
-            }
-        }
+        let final_next_tx = next_assign_tx + approved_records.len() as u64;
 
         // Durability Barrier Phase 1 & Phase 2
         let durability_res = (|| -> Result<()> {
@@ -206,19 +183,18 @@ impl<S: Storage> WriteTx<'_, S> {
                 let tables = self.manager.catalog.to_meta_entries();
                 let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
                 let meta =
-                    MetaPage::with_tables(new_root, catalog_root, TxId(next_assign_tx), tables);
+                    MetaPage::with_tables(new_root, catalog_root, TxId(final_next_tx), tables);
                 let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
                 let target_sb =
-                    crate::superblock::choose_commit_superblock(cur_sb, TxId(next_assign_tx));
+                    crate::superblock::choose_commit_superblock(cur_sb, TxId(final_next_tx));
                 crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
-                self.manager
-                    .active_superblock
-                    .store(target_sb.0, Ordering::Release);
-
                 self.manager.cache.flush_page(target_sb)?;
                 if self.manager.durability() == DurabilityMode::Immediate {
                     self.manager.cache.sync()?;
                 }
+                self.manager
+                    .active_superblock
+                    .store(target_sb.0, Ordering::Release);
             }
             Ok(())
         })();
@@ -227,7 +203,7 @@ impl<S: Storage> WriteTx<'_, S> {
             for &pid in &combined_pages.allocated {
                 self.manager.cache.free_page(pid);
             }
-            for (ticket, _) in &committed_slots {
+            for (ticket, _, _) in &approved_records {
                 let slot = self.manager.ring_buffer.get_slot(*ticket);
                 slot.status
                     .store(ring_buffer::SLOT_ABORTED, Ordering::Release);
@@ -241,12 +217,35 @@ impl<S: Storage> WriteTx<'_, S> {
             return Err(e);
         }
 
+        // Commit state publication strictly after durability succeeds
         self.manager
             .active_root
             .store(new_root.0, Ordering::Release);
         self.manager
             .next_tx_id
-            .store(next_assign_tx, Ordering::Release);
+            .store(final_next_tx, Ordering::Release);
+
+        let mut committed_slots = Vec::with_capacity(approved_records.len());
+        {
+            let mut history = self.manager.commit_history.write();
+            history.push_back(CommittedTxRecord {
+                tx_id: TxId(leader_commit_tx),
+                tables: self.modified_tables.clone(),
+                keys: leader_keys,
+            });
+
+            for (commit_tx, (ticket, tables, keys)) in (next_assign_tx..).zip(approved_records) {
+                history.push_back(CommittedTxRecord {
+                    tx_id: TxId(commit_tx),
+                    tables,
+                    keys,
+                });
+                committed_slots.push((ticket, commit_tx));
+            }
+            while history.len() > 2048 {
+                history.pop_front();
+            }
+        }
 
         if !cohort_tickets.is_empty() {
             self.manager

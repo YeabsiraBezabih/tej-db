@@ -1,5 +1,5 @@
 use crate::conflict::{CommittedTxRecord, validate_tx_conflict};
-use crate::meta::MetaPage;
+use crate::meta::{MetaPage, TableMetaEntry};
 use crate::write_tx::WriteTx;
 use smallvec::smallvec;
 use std::sync::Arc;
@@ -140,8 +140,45 @@ impl<S: Storage> WriteTx<'_, S> {
         // 8. Superblock write and history recording serialized under global commit_lock
         let commit_guard = self.manager.commit_lock.lock();
 
-        let commit_tx = self.manager.next_tx_id.fetch_add(1, Ordering::SeqCst);
+        let commit_tx = self.manager.next_tx_id.load(Ordering::Acquire);
         let new_next = commit_tx + 1;
+
+        // Durability Barrier Phase 2: Write MetaPage to alternating superblock, flush, and sync
+        if self.manager.durability() != DurabilityMode::None {
+            let mut meta_tables = self.manager.catalog.to_meta_entries();
+            for (tbl_name, root_id) in &new_roots {
+                if let Some(entry) = meta_tables.iter_mut().find(|e| e.name == *tbl_name) {
+                    entry.root_id = *root_id;
+                } else {
+                    meta_tables.push(TableMetaEntry {
+                        name: (*tbl_name).to_string(),
+                        root_id: *root_id,
+                    });
+                }
+            }
+            for tbl in &self.dropped_tables {
+                meta_tables.retain(|e| e.name != *tbl);
+            }
+
+            let active_root = new_default_root
+                .unwrap_or_else(|| PageId(self.manager.active_root.load(Ordering::Acquire)));
+            let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
+            let meta =
+                MetaPage::with_tables(active_root, catalog_root, TxId(new_next), meta_tables);
+            let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
+            let target_sb = crate::superblock::choose_commit_superblock(cur_sb, TxId(new_next));
+            crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
+            self.manager.cache.flush_page(target_sb)?;
+            if self.manager.durability() == DurabilityMode::Immediate {
+                self.manager.cache.sync()?;
+            }
+            self.manager
+                .active_superblock
+                .store(target_sb.0, Ordering::Release);
+        }
+
+        // Commit state publication strictly after durability succeeds
+        self.manager.next_tx_id.store(new_next, Ordering::Release);
 
         // Publish table roots and drops safely
         for (tbl_name, root_id) in new_roots {
@@ -188,25 +225,6 @@ impl<S: Storage> WriteTx<'_, S> {
         });
         if history.len() > 2048 {
             history.pop_front();
-        }
-
-        // Durability Barrier Phase 2: Write MetaPage to alternating superblock, flush, and sync
-        if self.manager.durability() != DurabilityMode::None {
-            let tables = self.manager.catalog.to_meta_entries();
-            let active_root = PageId(self.manager.active_root.load(Ordering::Acquire));
-            let catalog_root = PageId(self.manager.catalog_root.load(Ordering::Acquire));
-            let meta = MetaPage::with_tables(active_root, catalog_root, TxId(new_next), tables);
-            let cur_sb = PageId(self.manager.active_superblock.load(Ordering::Acquire));
-            let target_sb = crate::superblock::choose_commit_superblock(cur_sb, TxId(new_next));
-            crate::superblock::write_superblock(&self.manager.cache, target_sb, &meta)?;
-            self.manager
-                .active_superblock
-                .store(target_sb.0, Ordering::Release);
-
-            self.manager.cache.flush_page(target_sb)?;
-            if self.manager.durability() == DurabilityMode::Immediate {
-                self.manager.cache.sync()?;
-            }
         }
 
         // Safe reclamation: free retired pages after superblock sync

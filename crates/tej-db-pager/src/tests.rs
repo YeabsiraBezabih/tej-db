@@ -282,6 +282,60 @@ fn test_encrypted_storage_fresh_nonces_and_debug_redacted() {
     assert_ne!(raw_buf1, raw_buf2);
 }
 
+#[cfg(feature = "encryption")]
+#[test]
+fn test_encrypted_storage_superblock_isolation() {
+    let key = [0x5A; 32];
+    let raw = MemStorage::new();
+    let mut storage = EncryptedStorage::new(raw, key);
+
+    // Allocate SB0 (logical 0), SB1 (logical 1), Data 0 (logical 2)
+    let sb0 = storage.allocate_page().unwrap();
+    let sb1 = storage.allocate_page().unwrap();
+    let data0 = storage.allocate_page().unwrap();
+
+    assert_eq!(sb0, PageId(0));
+    assert_eq!(sb1, PageId(1));
+    assert_eq!(data0, PageId(2));
+
+    let mut p0 = Page::new(sb0, PageType::BTreeLeaf);
+    p0.payload_mut()[..8].copy_from_slice(b"SB0_DATA");
+    storage.write_page(sb0, p0.as_slice()).unwrap();
+
+    let mut p1 = Page::new(sb1, PageType::BTreeLeaf);
+    p1.payload_mut()[..8].copy_from_slice(b"SB1_DATA");
+    storage.write_page(sb1, p1.as_slice()).unwrap();
+
+    // Verify roundtrip read
+    let mut read_buf = [0u8; PAGE_SIZE];
+    storage.read_page(sb0, &mut read_buf).unwrap();
+    assert_eq!(&Page::from_bytes(read_buf).payload()[..8], b"SB0_DATA");
+
+    storage.read_page(sb1, &mut read_buf).unwrap();
+    assert_eq!(&Page::from_bytes(read_buf).payload()[..8], b"SB1_DATA");
+
+    // Inspect underlying physical storage:
+    // Physical page 0: SB0 tag page
+    // Physical page 1: SB0 ciphertext page
+    // Physical page 2: SB1 tag page
+    // Physical page 3: SB1 ciphertext page
+    let raw_inner = storage.into_inner();
+    assert!(raw_inner.page_count() >= 4);
+
+    // Corrupting SB1 tag page (physical page 2) must NOT affect SB0 decryption
+    let mut modified_raw = raw_inner;
+    let corrupt_tag = [0xFF; PAGE_SIZE];
+    modified_raw.write_page(PageId(2), &corrupt_tag).unwrap();
+
+    let reloaded = EncryptedStorage::new(modified_raw, key);
+    let mut p0_check = [0u8; PAGE_SIZE];
+    assert!(
+        reloaded.read_page(sb0, &mut p0_check).is_ok(),
+        "SB0 must decrypt cleanly despite SB1 tag page corruption"
+    );
+    assert_eq!(&Page::from_bytes(p0_check).payload()[..8], b"SB0_DATA");
+}
+
 #[test]
 fn test_file_lock_exclusivity() {
     let dir = tempfile::tempdir().unwrap();

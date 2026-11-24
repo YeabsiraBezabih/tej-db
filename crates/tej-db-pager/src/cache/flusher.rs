@@ -9,7 +9,7 @@ impl<S: Storage> PageCache<S> {
             return Ok(());
         }
 
-        let mut dirty_pages: Vec<(PageId, Page)> = Vec::new();
+        let mut dirty_pages: Vec<(PageId, Page, u64)> = Vec::new();
         for (s_idx, shard) in self.shards.iter().enumerate() {
             if (mask & (1 << s_idx)) != 0 {
                 let mut state = shard.state.write();
@@ -22,7 +22,7 @@ impl<S: Storage> PageCache<S> {
                     if let Some(entry) = entries.get_mut(&id) {
                         if entry.is_dirty {
                             entry.page.update_checksum();
-                            dirty_pages.push((id, entry.page.clone()));
+                            dirty_pages.push((id, entry.page.clone(), entry.dirty_seq));
                         }
                     }
                 }
@@ -33,8 +33,8 @@ impl<S: Storage> PageCache<S> {
             return Ok(());
         }
 
-        dirty_pages.sort_unstable_by_key(|(id, _)| *id);
-        dirty_pages.dedup_by_key(|(id, _)| *id);
+        dirty_pages.sort_unstable_by_key(|(id, _, _)| *id);
+        dirty_pages.dedup_by_key(|(id, _, _)| *id);
 
         let write_res = (|| -> Result<()> {
             let mut storage = self.storage.write();
@@ -70,15 +70,28 @@ impl<S: Storage> PageCache<S> {
             return Err(e);
         }
 
-        // Only clear dirty state after storage writes succeed
+        // Only clear dirty state for pages whose dirty_seq has not advanced during I/O
         for (s_idx, shard) in self.shards.iter().enumerate() {
             if (mask & (1 << s_idx)) != 0 {
                 let mut state = shard.state.write();
-                let dirty_ids = std::mem::take(&mut state.dirty_pages);
-                for id in dirty_ids {
-                    if let Some(entry) = state.entries.get_mut(&id) {
-                        entry.is_dirty = false;
+                let CacheShardState {
+                    dirty_pages: shard_dirty,
+                    entries,
+                    ..
+                } = &mut *state;
+                for (id, _, flushed_seq) in &dirty_pages {
+                    if self.shard_index(*id) == s_idx {
+                        if let Some(entry) = entries.get_mut(id) {
+                            if entry.dirty_seq == *flushed_seq {
+                                entry.is_dirty = false;
+                            }
+                        }
                     }
+                }
+                shard_dirty.retain(|id| entries.get(id).is_some_and(|e| e.is_dirty));
+                if !shard_dirty.is_empty() {
+                    self.dirty_shard_mask
+                        .fetch_or(1 << s_idx, Ordering::Release);
                 }
             }
         }
@@ -94,7 +107,7 @@ impl<S: Storage> PageCache<S> {
             return Ok(());
         }
 
-        let mut dirty_pages: Vec<(PageId, Page)> = Vec::new();
+        let mut dirty_pages: Vec<(PageId, Page, u64)> = Vec::new();
         for (s_idx, shard) in self.shards.iter().enumerate() {
             if (mask & (1 << s_idx)) != 0 {
                 let mut state = shard.state.write();
@@ -110,7 +123,7 @@ impl<S: Storage> PageCache<S> {
                     if let Some(entry) = entries.get_mut(&id) {
                         if entry.is_dirty {
                             entry.page.update_checksum();
-                            dirty_pages.push((id, entry.page.clone()));
+                            dirty_pages.push((id, entry.page.clone(), entry.dirty_seq));
                         }
                     }
                 }
@@ -121,8 +134,8 @@ impl<S: Storage> PageCache<S> {
             return Ok(());
         }
 
-        dirty_pages.sort_unstable_by_key(|(id, _)| *id);
-        dirty_pages.dedup_by_key(|(id, _)| *id);
+        dirty_pages.sort_unstable_by_key(|(id, _, _)| *id);
+        dirty_pages.dedup_by_key(|(id, _, _)| *id);
 
         let mut storage = self.storage.write();
         let mut i = 0;
@@ -150,7 +163,7 @@ impl<S: Storage> PageCache<S> {
         }
         drop(storage);
 
-        // Only clear data pages' dirty state after storage write succeeds
+        // Only clear data pages' dirty state if their dirty_seq matches flushed_seq
         for (s_idx, shard) in self.shards.iter().enumerate() {
             if (mask & (1 << s_idx)) != 0 {
                 let mut state = shard.state.write();
@@ -159,16 +172,20 @@ impl<S: Storage> PageCache<S> {
                     entries,
                     ..
                 } = &mut *state;
-                shard_dirty.retain(|id| {
-                    if id.0 >= 2 {
+                for (id, _, flushed_seq) in &dirty_pages {
+                    if self.shard_index(*id) == s_idx {
                         if let Some(entry) = entries.get_mut(id) {
-                            entry.is_dirty = false;
+                            if entry.dirty_seq == *flushed_seq {
+                                entry.is_dirty = false;
+                            }
                         }
-                        false
-                    } else {
-                        true
                     }
-                });
+                }
+                shard_dirty.retain(|id| entries.get(id).is_some_and(|e| e.is_dirty));
+                if !shard_dirty.is_empty() {
+                    self.dirty_shard_mask
+                        .fetch_or(1 << s_idx, Ordering::Release);
+                }
             }
         }
 

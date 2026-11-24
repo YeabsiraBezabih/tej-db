@@ -167,3 +167,63 @@ fn test_prepared_fast_path_check_constraint_validation() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_sql_null_three_valued_logic_and_reversed_bounds() -> Result<()> {
+    let tmp = NamedTempFile::new().map_err(tej_db_core::DbError::Io)?;
+    let db = Database::open_file(tmp.path())?;
+    let sql = SqlEngine::new(&db);
+
+    sql.execute("CREATE TABLE products (id INT PRIMARY KEY, price INT)")?;
+    sql.execute("INSERT INTO products VALUES (1, 100), (2, 200), (3, 300)")?;
+
+    // id > NULL and NULL < id must evaluate to UNKNOWN and return 0 rows
+    let res1 = sql.execute("SELECT * FROM products WHERE id > NULL")?;
+    assert_eq!(res1.rows.len(), 0, "id > NULL must return 0 rows");
+
+    let res2 = sql.execute("SELECT * FROM products WHERE NULL < id")?;
+    assert_eq!(res2.rows.len(), 0, "NULL < id must return 0 rows");
+
+    let res3 = sql.execute("SELECT * FROM products WHERE id = NULL")?;
+    assert_eq!(res3.rows.len(), 0, "id = NULL must return 0 rows");
+
+    // Reversed bounds: 1 < id <=> id > 1
+    let res4 = sql.execute("SELECT id FROM products WHERE 1 < id")?;
+    assert_eq!(res4.rows.len(), 2, "1 < id must return 2 rows (2, 3)");
+
+    // Reversed bounds with AND range: 1 < id AND id < 3
+    let res5 = sql.execute("SELECT id FROM products WHERE 1 < id AND id < 3")?;
+    assert_eq!(res5.rows.len(), 1, "1 < id AND id < 3 must return row 2");
+    assert_eq!(res5.rows[0][0], Value::Integer(2));
+
+    Ok(())
+}
+
+#[test]
+fn test_update_pkless_table_row_preservation() -> Result<()> {
+    let tmp = NamedTempFile::new().map_err(tej_db_core::DbError::Io)?;
+    let db = Database::open_file(tmp.path())?;
+    let sql = SqlEngine::new(&db);
+
+    sql.execute("CREATE TABLE items (val INT)")?;
+    sql.execute("INSERT INTO items VALUES (10), (20), (30)")?;
+
+    // Update val from 20 to 25 without primary key
+    let res = sql.execute("UPDATE items SET val = 25 WHERE val = 20")?;
+    assert_eq!(res.rows_affected, 1);
+
+    let rows = sql.execute("SELECT val FROM items")?;
+    assert_eq!(rows.rows.len(), 3);
+    let mut values: Vec<i64> = rows
+        .rows
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(i) => i,
+            _ => panic!("Expected int"),
+        })
+        .collect();
+    values.sort_unstable();
+    assert_eq!(values, vec![10, 25, 30]);
+
+    Ok(())
+}

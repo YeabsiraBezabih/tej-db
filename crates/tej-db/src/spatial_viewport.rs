@@ -67,6 +67,12 @@ impl<S: Storage> std::fmt::Debug for SpatialViewportManager<S> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransformDirection {
+    Forward,
+    Inverse,
+}
+
 impl<S: Storage> SpatialViewportManager<S> {
     /// Initializes a new spatial viewport manager backed by `table_name`.
     pub fn new(
@@ -320,9 +326,12 @@ impl<S: Storage> SpatialViewportManager<S> {
         closest_hit
     }
 
-    /// Applies a 3D gizmo translation to a cluster, updating its spatial bounds and Morton key.
-    /// Pushes the operation to the undo stack.
-    pub fn apply_transform(&mut self, transform: GizmoTransform) -> Result<bool> {
+    #[allow(clippy::needless_range_loop)]
+    fn transform_cluster_in_db(
+        &mut self,
+        transform: &GizmoTransform,
+        direction: TransformDirection,
+    ) -> Result<bool> {
         let Some(cluster) = self
             .clusters
             .iter_mut()
@@ -331,7 +340,6 @@ impl<S: Storage> SpatialViewportManager<S> {
             return Ok(false);
         };
 
-        // Old key deletion
         let old_key = encode_composite_cluster_key(
             &self.domain,
             cluster.lod_level,
@@ -339,24 +347,29 @@ impl<S: Storage> SpatialViewportManager<S> {
             cluster.cluster_id,
         );
 
-        // Update bounds & sphere
+        let mut updated_bounds = cluster.bounds;
+        let mut updated_center = cluster.sphere.center;
+        let sign = match direction {
+            TransformDirection::Forward => 1.0,
+            TransformDirection::Inverse => -1.0,
+        };
         for i in 0..3 {
-            cluster.bounds.min[i] += transform.translation[i];
-            cluster.bounds.max[i] += transform.translation[i];
-            cluster.sphere.center[i] += transform.translation[i];
+            let dt = sign * transform.translation[i];
+            updated_bounds.min[i] += dt;
+            updated_bounds.max[i] += dt;
+            updated_center[i] += dt;
         }
 
-        // New key insertion
         let new_key = encode_composite_cluster_key(
             &self.domain,
             cluster.lod_level,
-            cluster.sphere.center,
+            updated_center,
             cluster.cluster_id,
         );
-        let val_bytes = cluster.to_bytes();
-
-        self.soa
-            .update_position(transform.cluster_id, cluster.sphere.center);
+        let mut updated_cluster = *cluster;
+        updated_cluster.bounds = updated_bounds;
+        updated_cluster.sphere.center = updated_center;
+        let val_bytes = updated_cluster.to_bytes();
 
         let mut tx = self.tx_manager.begin_write()?;
         {
@@ -366,109 +379,47 @@ impl<S: Storage> SpatialViewportManager<S> {
         }
         tx.commit()?;
 
+        cluster.bounds = updated_bounds;
+        cluster.sphere.center = updated_center;
+        self.soa
+            .update_position(transform.cluster_id, updated_center);
+
+        Ok(true)
+    }
+
+    /// Applies a 3D gizmo translation to a cluster, updating its spatial bounds and Morton key.
+    /// Pushes the operation to the undo stack.
+    pub fn apply_transform(&mut self, transform: GizmoTransform) -> Result<bool> {
+        if !self.transform_cluster_in_db(&transform, TransformDirection::Forward)? {
+            return Ok(false);
+        }
         self.undo_stack.push(transform);
         self.redo_stack.clear();
-
         Ok(true)
     }
 
     /// Reverts the most recent gizmo transform, updating geometry bounds and B+ Tree keys.
     pub fn undo(&mut self) -> Result<Option<GizmoTransform>> {
-        let Some(transform) = self.undo_stack.pop() else {
+        let Some(&transform) = self.undo_stack.last() else {
             return Ok(None);
         };
-
-        let Some(cluster) = self
-            .clusters
-            .iter_mut()
-            .find(|c| c.cluster_id == transform.cluster_id)
-        else {
+        if !self.transform_cluster_in_db(&transform, TransformDirection::Inverse)? {
             return Ok(None);
-        };
-
-        let old_key = encode_composite_cluster_key(
-            &self.domain,
-            cluster.lod_level,
-            cluster.sphere.center,
-            cluster.cluster_id,
-        );
-
-        // Invert translation
-        for i in 0..3 {
-            cluster.bounds.min[i] -= transform.translation[i];
-            cluster.bounds.max[i] -= transform.translation[i];
-            cluster.sphere.center[i] -= transform.translation[i];
         }
-
-        let new_key = encode_composite_cluster_key(
-            &self.domain,
-            cluster.lod_level,
-            cluster.sphere.center,
-            cluster.cluster_id,
-        );
-        let val_bytes = cluster.to_bytes();
-
-        self.soa
-            .update_position(transform.cluster_id, cluster.sphere.center);
-
-        let mut tx = self.tx_manager.begin_write()?;
-        {
-            let mut tbl = tx.open_table_mut(&self.table_name)?;
-            tbl.delete(&old_key)?;
-            tbl.put(&new_key, &val_bytes)?;
-        }
-        tx.commit()?;
-
+        self.undo_stack.pop();
         self.redo_stack.push(transform);
         Ok(Some(transform))
     }
 
     /// Redoes the most recently undone gizmo transform.
     pub fn redo(&mut self) -> Result<Option<GizmoTransform>> {
-        let Some(transform) = self.redo_stack.pop() else {
+        let Some(&transform) = self.redo_stack.last() else {
             return Ok(None);
         };
-
-        let Some(cluster) = self
-            .clusters
-            .iter_mut()
-            .find(|c| c.cluster_id == transform.cluster_id)
-        else {
+        if !self.transform_cluster_in_db(&transform, TransformDirection::Forward)? {
             return Ok(None);
-        };
-
-        let old_key = encode_composite_cluster_key(
-            &self.domain,
-            cluster.lod_level,
-            cluster.sphere.center,
-            cluster.cluster_id,
-        );
-
-        for i in 0..3 {
-            cluster.bounds.min[i] += transform.translation[i];
-            cluster.bounds.max[i] += transform.translation[i];
-            cluster.sphere.center[i] += transform.translation[i];
         }
-
-        let new_key = encode_composite_cluster_key(
-            &self.domain,
-            cluster.lod_level,
-            cluster.sphere.center,
-            cluster.cluster_id,
-        );
-        let val_bytes = cluster.to_bytes();
-
-        self.soa
-            .update_position(transform.cluster_id, cluster.sphere.center);
-
-        let mut tx = self.tx_manager.begin_write()?;
-        {
-            let mut tbl = tx.open_table_mut(&self.table_name)?;
-            tbl.delete(&old_key)?;
-            tbl.put(&new_key, &val_bytes)?;
-        }
-        tx.commit()?;
-
+        self.redo_stack.pop();
         self.undo_stack.push(transform);
         Ok(Some(transform))
     }

@@ -107,7 +107,7 @@ crates/tej-db/
 
 | File | Lines | Primary Responsibilities | Design Patterns & Mechanisms |
 | :--- | :---: | :--- | :--- |
-| [`src/lib.rs`](file:///home/yeab/Projects/Work/modular-acid-dbms/crates/tej-db/src/lib.rs) | 343 | Main database facade; opening backends; online hot backup and compaction; transaction helper loops; durability controls. | Facade Pattern; Ping-pong superblock coordinate; automatic exponential backoff retry loop. |
+| [`src/lib.rs`](file:///home/yeab/Projects/Work/modular-acid-dbms/crates/tej-db/src/lib.rs) | 489 | Main database facade; opening backends; atomic physical backup/compact, `verify()` (`fsck`), `close()`; transaction retry loops; durability controls. | Facade Pattern; Ping-pong superblock coordinate; automatic exponential backoff retry loop. |
 | [`src/typed.rs`](file:///home/yeab/Projects/Work/modular-acid-dbms/crates/tej-db/src/typed.rs) | 288 | Type-safe Serde tables; order-preserving key serialization (`KeyCodec`). | Big-endian lexicographical preservation; zero-copy stack decoding. |
 | [`src/index.rs`](file:///home/yeab/Projects/Work/modular-acid-dbms/crates/tej-db/src/index.rs) | 153 | Secondary index compound key encoding; prefix scans; fluent query execution. | Compound key layout: `[len: u16][sec_key][pri_key]`; Builder Pattern for queries. |
 | [`src/vector.rs`](file:///home/yeab/Projects/Work/modular-acid-dbms/crates/tej-db/src/vector.rs) | 322 | Transactional vector index coordinator; delta table buffering; Vamana beam search. | Write-ahead delta B+ tree staging; asynchronous compaction into 4 KiB packed graph pages. |
@@ -171,12 +171,15 @@ sequenceDiagram
    ```
    Backs storage by concurrent hash tables and heap memory. Ideal for automated testing, temporary query caches, and ultra-high-throughput ephemeral staging buffers ($>1.2\text{M ops/sec}$).
 
-### Online Hot Backups & Dynamic Compaction
+### Online Hot Backups, Verification & Shutdown
 
-`Database::backup(&self, destination_path)` performs an online, non-blocking snapshot backup while concurrent read and write transactions are executing:
-- Obtains a consistent point-in-time `ReadOnlyTx`.
-- Streams all allocated pages through a clean destination file storage.
-- Compacts free-list fragmentation and writes a single verified superblock to the target.
+`Database::backup(&self, destination_path)` performs an atomic, point-in-time physical snapshot backup under `commit_lock`:
+- Flushes and syncs dirty pages in `PageCache`.
+- Writes data pages (`2..count`) followed by superblocks (`0..2`) to a temporary `.backup_tmp` file, calls `sync()`, and atomically renames it into place (preserving all B+ trees, `VectorNode` pages, and `MeshletNode` pages with exact `PageId` references).
+
+Additional lifecycle helpers (`v0.1.1`):
+- `Database::verify(&self) -> Result<(usize, usize)>`: Structural integrity verifier (`fsck`) checking strict sorted key invariants across the default table and all named tables.
+- `Database::close(self) -> Result<()>`: Explicit graceful shutdown flushing and syncing all dirty pages across any `Storage` backend.
 
 ---
 

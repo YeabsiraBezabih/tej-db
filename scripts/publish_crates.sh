@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # scripts/publish_crates.sh
-# Publishes all 10 TejDB crates to crates.io in topological dependency order.
+# Publishes all 11 TejDB crates to crates.io in topological dependency order.
 # ==============================================================================
 
 set -euo pipefail
@@ -26,6 +26,7 @@ CRATES=(
     "tej-db"
     "tej-db-sql"
     "tej-db-cli"
+    "tej-db-ffi"
 )
 
 # Optional dry run flag

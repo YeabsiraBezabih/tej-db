@@ -145,8 +145,9 @@ crates/tej-db-core/
     ├── types.rs                # PageId, TxId, DurabilityMode, WriteBatch, KeyRange, DbStats
     ├── tests.rs                # Core test suite covering slotted leaf/internal & batching
     ├── page/
-    │   ├── mod.rs              # Page struct, PageHeader, PageType, slot offset calculations
-    │   ├── leaf.rs             # Slotted B-Tree leaf operations (in-place, COW, split, search)
+    │   ├── mod.rs              # Page struct, PageHeader, PageType, bounds-checked slot offsets
+    │   ├── leaf.rs             # Slotted B-Tree leaf operations (in-place, COW, search)
+    │   ├── leaf_split.rs       # Leaf split algorithms (50/50 & right-edge append split)
     │   ├── internal.rs         # Slotted B-Tree internal operations (routing, child swaps, split)
     │   ├── overflow.rs         # Overflow BLOB page initialization & extent formatting
     │   └── simd_crc.rs         # Hardware-accelerated CRC32C (SSE4.2 / crc32fast)
@@ -168,7 +169,8 @@ crates/tej-db-core/
 | `src/error.rs` | Error classification | $\sim 68$ | `DbError`, `Result<T>` |
 | `src/traits.rs` | Storage & Index SPI | $\sim 183$ | `Storage`, `Index`, `Durability`, `Hook` |
 | `src/page/mod.rs` | 4 KiB Slotted Page core | $\sim 280$ | `Page`, `PageHeader`, `PageType`, `PAGE_SIZE`, `PAGE_HEADER_SIZE` |
-| `src/page/leaf.rs` | Leaf node logic | $\sim 482$ | `leaf_get_kv`, `leaf_insert_inplace`, `leaf_append_inplace`, `leaf_split_into_at` |
+| `src/page/leaf.rs` | Leaf node logic | $\sim 455$ | `leaf_get_kv`, `leaf_insert_inplace`, `leaf_append_inplace` |
+| `src/page/leaf_split.rs` | Leaf node splitting | $\sim 82$ | `leaf_split_into`, `leaf_split_into_at` |
 | `src/page/internal.rs`| Internal node logic | $\sim 333$ | `internal_search`, `internal_insert_inplace`, `internal_split_into` |
 | `src/page/overflow.rs`| Large payload extents | $\sim 47$ | `new_overflow`, `format_overflow_slice` |
 | `src/page/simd_crc.rs`| Checksum verification | $\sim 69$ | `compute_page_checksum`, `compute_crc32c_portable` |

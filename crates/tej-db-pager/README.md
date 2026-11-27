@@ -135,20 +135,21 @@ crates/tej-db-pager/
 └── src/
     ├── lib.rs                  # Module root declarations, conditional feature flags, re-exports
     ├── file.rs                 # FileStorage: POSIX pread64/pwrite64, extent I/O, fdatasync
+    ├── lock.rs                 # FileLock: Advisory exclusive locking (Unix flock / Windows LockFileEx)
     ├── mmap.rs                 # MmapStorage: Dynamic growth, RwLock-guarded MmapMut
     ├── mmap_view.rs            # ZeroCopyPageView: Slice borrowing, in-place header/CRC verify
     ├── mem.rs                  # MemStorage: Fast in-memory hash-backed storage for tests/ephemeral DBs
     ├── compression.rs          # CompressedStorage: Per-page LZ4 block compression with fallback
-    ├── encryption.rs           # EncryptedStorage: Per-page ChaCha20-Poly1305, Stride-257 tag catalog
+    ├── encryption.rs           # EncryptedStorage: Per-page ChaCha20-Poly1305 with 1:1 physical tag pages
     ├── tests.rs                # Comprehensive unit and integration test suite
     └── cache/
-        ├── mod.rs              # PageCache struct, 16-way sharding, with_page / with_page_mut APIs
-        ├── shard.rs            # CacheShard, CacheShardState, CacheEntry with atomic reference bits
+        ├── mod.rs              # PageCache struct, 16-way sharding, rollback-safe with_page_mut, discard_page
+        ├── shard.rs            # CacheShard, CacheShardState, CacheEntry with dirty_seq & per-shard stats
         ├── hasher.rs           # FastPageIdHasher: Multiply-xorshift hash algorithm
         ├── eviction.rs         # Clock (Second-Chance) O(1) eviction implementation
         ├── s3_fifo.rs          # S3-FIFO scan-resistant queue (Small, Main, Ghost)
         ├── allocator.rs        # Free-list recycling, pending-free isolation, extent allocation
-        └── flusher.rs          # Dirty shard scanning, page sorting, contiguous extent coalescing
+        └── flusher.rs          # flush_lock-serialized dirty scanning, sorting, extent coalescing
 ```
 
 ### Module Breakdown

@@ -83,10 +83,12 @@ crates/tej-db-sql/
 └── src/
     ├── lib.rs                  # Crate root: re-exports, module declarations, public facade
     ├── engine.rs               # SqlEngine facade: plan cache, parser orchestration, statement execution
-    ├── executor.rs             # Physical execution of DDL, DML, DQL plans over WriteTx and ReadOnlyTx
-    ├── plan.rs                 # Plan AST, ProjectionItem, Primary Key optimization & where clause pushdown
+    ├── executor.rs             # Physical execution of DDL, DML, DQL (ORDER BY, DISTINCT, OFFSET, LIMIT)
+    ├── plan.rs                 # Plan AST, ProjectionItem, OrderBySpec, PK & clause validation
+    ├── bounds.rs               # Primary key equality/range pushdown, negative i64::MIN & 3VL NULL bounds
     ├── plan_ddl.rs             # CREATE TABLE AST parser, column mapping, table constraint planner
     ├── plan_dml.rs             # INSERT/UPDATE/DELETE planners, ON CONFLICT mapper, RETURNING clause parser
+    ├── param_subst.rs          # Positional ($1, ?) parameter substitution across AST expressions
     ├── prepared.rs             # PreparedStatement & CompiledStatement fast paths (PointInsert, PointQuery)
     ├── schema.rs               # TableSchema, ColumnDef, SqlType, binary row serialization & key encoding
     ├── value.rs                # Dynamic Value enum, coercion, ternary SQL comparisons, key formatting
@@ -97,7 +99,7 @@ crates/tej-db-sql/
     ├── window.rs               # Window functions: ROW_NUMBER, RANK, DENSE_RANK, SUM, AVG over partitions
     ├── fts.rs                  # Inverted full-text index: Okapi BM25 scoring, tokenization, hybrid RRF
     ├── hybrid.rs               # Relational + vector search: RoaringBitmap filter, SIMD scan vs. Vamana routing
-    ├── upsert.rs               # OnConflict (DoNothing, DoUpdate) and ReturningClause structures
+    ├── upsert.rs               # OnConflict (DoNothing, DoUpdate), ReturningClause & project_returning_row
     ├── result.rs               # QueryResult tabular formatting, column width calculation, display
     ├── tests.rs                # Comprehensive end-to-end integration tests for the SQL engine
     ├── cbo/

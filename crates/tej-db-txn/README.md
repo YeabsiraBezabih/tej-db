@@ -135,21 +135,22 @@ crates/tej-db-txn/
     ├── lib.rs                  # Module root, re-exports, public types
     ├── meta.rs                 # MetaPage struct, magic "TEJD", versioning, table entries
     ├── superblock.rs           # Dual superblock (Ping-Pong 0/1), torn-write recovery logic
-    ├── manager.rs              # TxManager engine: begin_read, begin_write, cohort drainage
+    ├── manager.rs              # TxManager engine: begin_read, begin_write, flusher lifecycle
+    ├── cohort.rs               # drain_and_commit_cohort: group-commit follower batching & barrier
     ├── read_tx.rs              # ReadOnlyTx: Snapshot isolation queries, table refs
-    ├── write_tx.rs             # WriteTx: Delta buffers, OCC mutation methods, rollback
+    ├── write_tx.rs             # WriteTx: Delta buffers, OCC mutation methods, table management
     ├── commit.rs               # Transaction commit engine: single vs leader/cohort ingestion
     ├── conflict.rs             # validate_tx_conflict: linear two-pointer hazard detection
     ├── group_commit.rs         # GroupCommitCoordinator: hardware sync leader election
-    ├── savepoint.rs            # SavepointSnapshot: nested transaction checkpoints & rollback
+    ├── savepoint.rs            # SavepointSnapshot: nested checkpoints, rollback, and WriteTx Drop
     ├── ring_buffer.rs          # DisruptorRingBuffer: 4096 cache-line aligned IngestSlots (64B)
     ├── write_combining.rs      # TableWriteQueue: per-table concurrent write coalescing
     ├── sharding.rs             # ShardedTable: range-partitioned multi-B-Tree routing
-    ├── spin.rs                 # AdaptiveSpinLock: 3-tier pause/yield/sleep backoff
+    ├── spin.rs                 # AdaptiveSpinLock: fair Mutex-backed lock preserving spinlock API
     ├── catalog.rs              # TableCatalog: atomic lock-free table root descriptor map
     ├── catalog_tree.rs         # Catalog B+ tree (__sys_catalog__) serialization
     ├── table.rs                # TableRef & TableMut scoped handles
-    ├── table_commit.rs         # commit_tables: multi-table commit ordering & deadlocks
+    ├── table_commit.rs         # commit_tables: canonical lock ordering, default-table OCC & barriers
     └── tests.rs                # Comprehensive test suite (CRUD, OCC, savepoints, sharding)
 ```
 

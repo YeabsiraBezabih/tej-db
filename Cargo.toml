@@ -80,7 +80,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # TUI & Terminal
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Optional & Advanced Storage / Compression / Encryption / Serialization
 bincode = "1.3"

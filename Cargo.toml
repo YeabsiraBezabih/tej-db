@@ -49,7 +49,7 @@ anyhow = "1.0"
 
 # Checksumming & hashing
 crc32fast = "1.4"
-roaring = { version = "0.10", features = ["serde"] }
+roaring = { version = "0.12", features = ["serde"] }
 
 # Synchronization & concurrency
 parking_lot = "0.12"

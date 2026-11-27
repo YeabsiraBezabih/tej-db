@@ -38,8 +38,9 @@ impl<S: Storage> PageCache<S> {
             hand = (hand + 1) % ring_len;
         }
 
-        // Pass 2: If all pages are dirty, select an unreferenced dirty victim
-        if victim_id.is_none() {
+        // Pass 2: If all pages are dirty, select an unreferenced dirty victim only if flush_lock is uncontended
+        let flush_guard = self.flush_lock.try_lock();
+        if victim_id.is_none() && flush_guard.is_some() {
             for _ in 0..(ring_len * 2) {
                 let candidate_id = state.clock_ring[hand];
                 if let Some(entry) = state.entries.get(&candidate_id) {
@@ -64,8 +65,9 @@ impl<S: Storage> PageCache<S> {
                     entry.page.update_checksum();
                     let page_bytes = entry.page.clone();
                     let mut storage = self.storage.write();
-                    // Crucial: write to storage before removing from cache entries
+                    // Crucial: write to storage under flush_lock before removing from cache entries
                     storage.write_page(id, page_bytes.as_slice())?;
+                    drop(flush_guard);
                     entry.is_dirty = false;
                 }
             }

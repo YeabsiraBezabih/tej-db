@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85.0"
 authors = [
@@ -31,17 +31,17 @@ documentation = "https://docs.rs/tej-db"
 readme = "README.md"
 
 [workspace.dependencies]
-tej-db-core = { version = "0.1.0", path = "crates/tej-db-core" }
-tej-db-pager = { version = "0.1.0", path = "crates/tej-db-pager" }
-tej-db-btree = { version = "0.1.0", path = "crates/tej-db-btree" }
-tej-db-txn = { version = "0.1.0", path = "crates/tej-db-txn" }
-tej-db = { version = "0.1.0", path = "crates/tej-db" }
-tej-db-sql = { version = "0.1.0", path = "crates/tej-db-sql" }
-tej-db-vector = { version = "0.1.0", path = "crates/tej-db-vector" }
-tej-db-columnar = { version = "0.1.0", path = "crates/tej-db-columnar" }
-tej-db-vectorized = { version = "0.1.0", path = "crates/tej-db-vectorized" }
-tej-db-cli = { version = "0.1.0", path = "crates/tej-db-cli" }
-tej-db-ffi = { version = "0.1.0", path = "crates/tej-db-ffi" }
+tej-db-core = { version = "0.1.1", path = "crates/tej-db-core" }
+tej-db-pager = { version = "0.1.1", path = "crates/tej-db-pager" }
+tej-db-btree = { version = "0.1.1", path = "crates/tej-db-btree" }
+tej-db-txn = { version = "0.1.1", path = "crates/tej-db-txn" }
+tej-db = { version = "0.1.1", path = "crates/tej-db" }
+tej-db-sql = { version = "0.1.1", path = "crates/tej-db-sql" }
+tej-db-vector = { version = "0.1.1", path = "crates/tej-db-vector" }
+tej-db-columnar = { version = "0.1.1", path = "crates/tej-db-columnar" }
+tej-db-vectorized = { version = "0.1.1", path = "crates/tej-db-vectorized" }
+tej-db-cli = { version = "0.1.1", path = "crates/tej-db-cli" }
+tej-db-ffi = { version = "0.1.1", path = "crates/tej-db-ffi" }
 
 # Error handling
 thiserror = "2.0"

@@ -89,6 +89,14 @@ impl<'a, 'tx, S: Storage> TableMut<'a, 'tx, S> {
         }
     }
 
+    pub fn with_value<R>(
+        &mut self,
+        key: &[u8],
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<Option<R>> {
+        self.tx.with_table_value_idx(self.idx, key, f)
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.tx.get_table_key(&self.name, key)
     }

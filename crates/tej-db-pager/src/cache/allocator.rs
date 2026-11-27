@@ -174,10 +174,12 @@ impl<S: Storage> PageCache<S> {
     }
 
     pub fn stats(&self) -> (u64, u64, usize) {
-        let hits = self.hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
-        let mut count = 0;
+        let mut hits = 0u64;
+        let mut misses = 0u64;
+        let mut count = 0usize;
         for shard in &self.shards {
+            hits += shard.hits.load(Ordering::Relaxed);
+            misses += shard.misses.load(Ordering::Relaxed);
             count += shard.state.read().entries.len();
         }
         (hits, misses, count)

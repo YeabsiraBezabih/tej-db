@@ -196,7 +196,10 @@ impl<S: Storage> SpatialViewportManager<S> {
         page.data[128..128 + vertex_indices.len()].copy_from_slice(vertex_indices);
         page.update_checksum();
 
-        self.tx_manager.cache().write_page(page)?;
+        if let Err(e) = self.tx_manager.cache().write_page(page) {
+            self.tx_manager.cache().free_page(page_id);
+            return Err(e);
+        }
 
         let metadata = ClusterMetadata::new(
             cluster_id,

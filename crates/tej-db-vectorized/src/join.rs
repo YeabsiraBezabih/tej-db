@@ -225,26 +225,33 @@ impl PhysicalOperator for PhysicalHashJoin {
                 }
             }
 
-            for &k in keys {
-                all_keys.push(k);
-                #[allow(clippy::cast_sign_loss)]
-                {
-                    self.bloom_filter |= 1u64 << ((k as u64) & 63);
+            let has_nulls = key_col.null_count() > 0;
+            for (idx, &k) in keys.iter().enumerate() {
+                if !has_nulls || !key_col.is_null(idx) {
+                    all_keys.push(Some(k));
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        self.bloom_filter |= 1u64 << ((k as u64) & 63);
+                    }
+                    self.hash_index.entry(k).or_default().push(row_counter);
+                } else {
+                    all_keys.push(None);
                 }
-                self.hash_index.entry(k).or_default().push(row_counter);
                 row_counter += 1;
             }
         }
 
-        let min_k = all_keys.iter().copied().min().unwrap_or(0);
-        let max_k = all_keys.iter().copied().max().unwrap_or(0);
-        if !all_keys.is_empty() && min_k >= 0 && max_k < 65536 {
+        let min_k = all_keys.iter().flatten().copied().min().unwrap_or(0);
+        let max_k = all_keys.iter().flatten().copied().max().unwrap_or(0);
+        if all_keys.iter().any(Option::is_some) && min_k >= 0 && max_k < 65536 {
             #[allow(clippy::cast_sign_loss)]
             let cap = (max_k as usize) + 1;
             self.direct_build_index = vec![SmallVec::new(); cap];
-            for (r_idx, &k) in all_keys.iter().enumerate() {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                self.direct_build_index[k as usize].push(r_idx as u32);
+            for (r_idx, k_opt) in all_keys.iter().enumerate() {
+                if let Some(k) = k_opt {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    self.direct_build_index[*k as usize].push(r_idx as u32);
+                }
             }
             self.use_direct_build = true;
         }
@@ -288,9 +295,15 @@ impl PhysicalOperator for PhysicalHashJoin {
                 })
                 .collect();
 
+            let probe_has_nulls = probe_key_col.null_count() > 0;
             let num_probe_rows = probe_keys.len();
             while self.probe_row_cursor < num_probe_rows {
                 let probe_row_idx = self.probe_row_cursor;
+                if probe_has_nulls && probe_key_col.is_null(probe_row_idx) {
+                    self.probe_row_cursor += 1;
+                    self.build_match_cursor = 0;
+                    continue;
+                }
                 let pk = probe_keys[probe_row_idx];
 
                 #[allow(clippy::cast_sign_loss)]

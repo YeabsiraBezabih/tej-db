@@ -1,5 +1,5 @@
 use crate::expr::evaluate_expr;
-use crate::plan::ProjectionItem;
+use crate::plan::{OrderBySpec, ProjectionItem};
 use crate::schema::TableSchema;
 use crate::value::Value;
 use sqlparser::ast::Expr as SqlExpr;
@@ -83,13 +83,27 @@ impl fmt::Display for QueryResult {
 }
 
 /// Helper function to project, filter, and limit rows from scanned or retrieved KV items.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectOptions<'a> {
+    pub distinct: bool,
+    pub order_by: &'a [OrderBySpec],
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 pub fn execute_select_from_items(
     schema: &TableSchema,
     projection: &[ProjectionItem],
     filter: Option<&SqlExpr>,
-    limit: Option<usize>,
+    opts: SelectOptions<'_>,
     items: impl IntoIterator<Item = KV>,
 ) -> Result<QueryResult> {
+    let SelectOptions {
+        distinct,
+        order_by,
+        limit,
+        offset,
+    } = opts;
     // Resolve projected column names
     let mut out_cols = Vec::new();
     let is_wildcard = projection
@@ -118,7 +132,17 @@ pub fn execute_select_from_items(
         }
     }
 
-    let mut out_rows = Vec::new();
+    if limit == Some(0) {
+        return Ok(QueryResult {
+            columns: out_cols,
+            rows: Vec::new(),
+            rows_affected: 0,
+        });
+    }
+
+    let can_early_limit = order_by.is_empty() && !distinct && offset.unwrap_or(0) == 0;
+    let mut sort_entries: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+
     for item in items {
         let row = schema.decode_row_value(&item.value)?;
 
@@ -133,7 +157,7 @@ pub fn execute_select_from_items(
         // Project values
         let mut proj_row = Vec::new();
         if is_wildcard {
-            proj_row = row;
+            proj_row.clone_from(&row);
         } else {
             for item in projection {
                 match item {
@@ -141,7 +165,10 @@ pub fn execute_select_from_items(
                         if let Some(idx) = schema.column_index(name) {
                             proj_row.push(row.get(idx).cloned().unwrap_or(Value::Null));
                         } else {
-                            proj_row.push(Value::Null);
+                            return Err(tej_db_core::DbError::Custom(format!(
+                                "Column '{name}' not found in table '{}'",
+                                schema.name
+                            )));
                         }
                     }
                     ProjectionItem::Expr { expr, .. } => {
@@ -152,13 +179,76 @@ pub fn execute_select_from_items(
                 }
             }
         }
-        out_rows.push(proj_row);
 
-        if let Some(lim) = limit {
-            if out_rows.len() >= lim {
-                break;
+        let mut sort_keys = Vec::with_capacity(order_by.len());
+        for ob in order_by {
+            sort_keys.push(evaluate_expr(&ob.expr, schema, &row)?);
+        }
+        sort_entries.push((sort_keys, proj_row));
+
+        if can_early_limit {
+            if let Some(lim) = limit {
+                if sort_entries.len() >= lim {
+                    break;
+                }
             }
         }
+    }
+
+    if !order_by.is_empty() {
+        sort_entries.sort_by(|(ka, _), (kb, _)| {
+            for (i, ob) in order_by.iter().enumerate() {
+                let va = &ka[i];
+                let vb = &kb[i];
+                let nulls_first = ob.nulls_first.unwrap_or(!ob.asc);
+                let ord = match (va.is_null(), vb.is_null()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => {
+                        if nulls_first {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if nulls_first {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    }
+                    (false, false) => {
+                        let c = va.sql_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+                        if ob.asc { c } else { c.reverse() }
+                    }
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    let mut out_rows: Vec<Vec<Value>> = sort_entries.into_iter().map(|(_, r)| r).collect();
+    if distinct {
+        let mut deduped = Vec::with_capacity(out_rows.len());
+        for row in out_rows {
+            if !deduped.contains(&row) {
+                deduped.push(row);
+            }
+        }
+        out_rows = deduped;
+    }
+    if let Some(off) = offset {
+        if off >= out_rows.len() {
+            out_rows.clear();
+        } else if off > 0 {
+            out_rows.drain(..off);
+        }
+    }
+    if let Some(lim) = limit {
+        out_rows.truncate(lim);
     }
 
     Ok(QueryResult {

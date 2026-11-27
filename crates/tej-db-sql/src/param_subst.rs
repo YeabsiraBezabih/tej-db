@@ -20,7 +20,10 @@ pub fn substitute_plan_params(plan: &mut Plan, params: &[Value]) -> Result<()> {
             }
         }
         Plan::Select {
-            projection, filter, ..
+            projection,
+            filter,
+            order_by,
+            ..
         } => {
             for item in projection {
                 if let ProjectionItem::Expr { expr, .. } = item {
@@ -29,6 +32,9 @@ pub fn substitute_plan_params(plan: &mut Plan, params: &[Value]) -> Result<()> {
             }
             if let Some(f) = filter {
                 substitute_expr(f, params, &mut counter, 0)?;
+            }
+            for ob in order_by {
+                substitute_expr(&mut ob.expr, params, &mut counter, 0)?;
             }
         }
         Plan::Update {

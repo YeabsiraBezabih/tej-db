@@ -1,3 +1,4 @@
+use crate::WriteTx;
 use tej_db_core::{PageId, Result, Storage};
 
 /// State snapshot of a single table within a savepoint.
@@ -67,6 +68,8 @@ impl SavepointSnapshot {
         for saved in &self.table_states {
             if let Some(ts) = tx.table_states.iter_mut().find(|t| t.name == saved.name) {
                 ts.pending_writes.truncate(saved.pending_writes_len);
+                ts.pending_lookup.clear();
+                ts.pending_lookup_len = 0;
                 ts.btree.set_root_id(saved.root_page);
                 ts.is_sorted = saved.is_sorted;
             }
@@ -80,5 +83,73 @@ impl SavepointSnapshot {
         tx.changes.deletes.truncate(self.changes_deletes_len);
 
         Ok(())
+    }
+}
+
+impl<S: Storage> WriteTx<'_, S> {
+    pub fn rollback(mut self) -> Result<()> {
+        self.pending_writes.clear();
+        self.modified_tables.clear();
+        for &pid in &self.tx_pages {
+            self.manager.cache.free_page(pid);
+        }
+        for state in &mut self.table_states {
+            for &pid in &state.tx_pages {
+                self.manager.cache.free_page(pid);
+            }
+        }
+        self.table_states.clear();
+        self.created_tables.clear();
+        self.dropped_tables.clear();
+        self.savepoints.clear();
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Creates a named savepoint capturing current transaction state.
+    pub fn savepoint(&mut self, name: &str) {
+        let snap = SavepointSnapshot::capture(name, self);
+        self.savepoints.push(snap);
+    }
+
+    /// Rolls back all mutations performed after the named savepoint was set.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or_else(|| tej_db_core::DbError::Custom(format!("Savepoint not found: {name}")))?;
+        let snap = self.savepoints[pos].clone();
+        snap.rollback_tx(self)?;
+        self.savepoints.truncate(pos + 1);
+        Ok(())
+    }
+
+    /// Releases a named savepoint and any savepoints created after it without rolling back.
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let pos = self
+            .savepoints
+            .iter()
+            .rposition(|s| s.name == name)
+            .ok_or_else(|| tej_db_core::DbError::Custom(format!("Savepoint not found: {name}")))?;
+        self.savepoints.truncate(pos);
+        Ok(())
+    }
+}
+
+impl<S: Storage> Drop for WriteTx<'_, S> {
+    fn drop(&mut self) {
+        if !self.committed {
+            for &pid in &self.tx_pages {
+                self.manager.cache.free_page(pid);
+            }
+            for state in &self.table_states {
+                for &pid in &state.tx_pages {
+                    self.manager.cache.free_page(pid);
+                }
+            }
+            tracing::debug!("Write transaction {} aborted/rolled back", self.tx_id);
+        }
+        self.manager.cache.release_reader();
     }
 }

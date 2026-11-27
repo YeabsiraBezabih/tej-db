@@ -34,10 +34,77 @@ impl<S: Storage> BTreeIndex<S> {
         while idx < batch.len() {
             let (key, val_opt, is_overflow_ref) = &batch[idx];
             let Some(val) = val_opt else {
-                cursor_path = None;
-                cursor_upper_bound = None;
-                last_key = None;
-                let _ = self.remove_in_tx(key, tx_pages)?;
+                let mut can_delete_in_leaf = false;
+                if cursor_path.is_some() {
+                    if let Some(ref lk) = last_key {
+                        if key.as_slice() >= lk.as_slice() {
+                            if let Some(ref ub) = cursor_upper_bound {
+                                if key.as_slice() < ub.as_slice() {
+                                    can_delete_in_leaf = true;
+                                }
+                            } else {
+                                can_delete_in_leaf = true;
+                            }
+                        }
+                    }
+                }
+
+                let active_leaf_opt = cursor_path.as_ref().and_then(|p| p.last().copied());
+                if let Some(leaf_id) = active_leaf_opt {
+                    if can_delete_in_leaf && tx_pages.contains(&leaf_id) {
+                        let mut chunk_deleted = 0usize;
+                        let mut retired_ov: Vec<(u64, PageId)> = Vec::new();
+                        self.cache.with_page_mut(leaf_id, |p| {
+                            while idx + chunk_deleted < batch.len() {
+                                let (k, v_opt, _) = &batch[idx + chunk_deleted];
+                                if v_opt.is_some() {
+                                    break;
+                                }
+                                if let Some(ref ub) = cursor_upper_bound {
+                                    if k.as_slice() >= ub.as_slice() {
+                                        break;
+                                    }
+                                }
+                                let (_, ov) = p.leaf_delete_inplace(k.as_slice())?;
+                                if let Some(ov_ref) = ov {
+                                    retired_ov.push(ov_ref);
+                                }
+                                if let Some(ref mut lk) = last_key {
+                                    lk.clear();
+                                    lk.extend_from_slice(k.as_slice());
+                                } else {
+                                    last_key = Some(InlineKey::from_slice(k.as_slice()));
+                                }
+                                chunk_deleted += 1;
+                            }
+                            Ok(())
+                        })?;
+                        for (total_len, old_first) in retired_ov {
+                            let num_pages = if total_len == 0 {
+                                1
+                            } else {
+                                total_len.div_ceil(tej_db_core::PAGE_SIZE as u64)
+                            };
+                            for p_idx in 0..num_pages {
+                                tx_pages.retire(PageId(old_first.0 + p_idx));
+                            }
+                        }
+                        if chunk_deleted > 0 {
+                            idx += chunk_deleted;
+                            continue;
+                        }
+                    }
+                }
+
+                let (_, path, bound) = self.remove_in_tx_prepared(key, tx_pages)?;
+                cursor_path = Some(path);
+                cursor_upper_bound = bound.map(|b| InlineKey::from_slice(&b));
+                if let Some(ref mut lk) = last_key {
+                    lk.clear();
+                    lk.extend_from_slice(key.as_slice());
+                } else {
+                    last_key = Some(InlineKey::from_slice(key.as_slice()));
+                }
                 idx += 1;
                 continue;
             };

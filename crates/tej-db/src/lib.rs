@@ -140,35 +140,41 @@ impl Database<FileStorage> {
         // 1. Serialize backup under commit_lock to ensure point-in-time ACID crash consistency
         let _commit_guard = self.tx_manager.commit_lock().lock();
 
-        // 2. Flush and sync all pending dirty pages to disk so storage is 100% up to date
+        // 2. Flush all pending dirty pages to disk (flush() issues sync() internally)
         self.cache.flush()?;
-        self.cache.sync()?;
 
-        // 3. Copy physical pages directly to destination file storage
-        // This preserves all tables, catalog metadata, VectorNode pages, and MeshletNode pages
-        // with exact PageId references intact.
+        // 3. Atomically copy physical pages to a temp file (data pages first, superblocks last) and rename.
+        let tmp_p = dest_p.with_extension("backup_tmp");
+        let _ = std::fs::remove_file(&tmp_p);
         let src_storage = self.cache.storage().read();
         let count = src_storage.page_count();
-        let mut dest_storage = FileStorage::open(dest_p)?;
-        let mut buf = [0u8; PAGE_SIZE];
-        for i in 0..count {
-            let pid = PageId(i);
-            src_storage.read_page(pid, &mut buf)?;
-            dest_storage.write_page(pid, &buf)?;
+        let copy_res: Result<()> = (|| {
+            let mut dest_storage = FileStorage::open(&tmp_p)?;
+            let mut buf = [0u8; PAGE_SIZE];
+            for i in 2..count {
+                let pid = PageId(i);
+                src_storage.read_page(pid, &mut buf)?;
+                dest_storage.write_page(pid, &buf)?;
+            }
+            for i in 0..count.min(2) {
+                let pid = PageId(i);
+                src_storage.read_page(pid, &mut buf)?;
+                dest_storage.write_page(pid, &buf)?;
+            }
+            dest_storage.sync()?;
+            Ok(())
+        })();
+        if let Err(e) = copy_res {
+            let _ = std::fs::remove_file(&tmp_p);
+            return Err(e);
         }
-        dest_storage.sync()?;
+        std::fs::rename(&tmp_p, dest_p).map_err(DbError::Io)?;
         Ok(())
     }
 
     /// Compact all active database pages into a new database file, removing free-list holes.
     pub fn compact(&self, dest_path: impl AsRef<Path>) -> Result<()> {
         self.backup(dest_path)
-    }
-
-    /// Explicitly close and flush all dirty pages down to storage and issue a hardware sync.
-    pub fn close(self) -> Result<()> {
-        self.cache.flush()?;
-        self.cache.sync()
     }
 }
 
@@ -409,6 +415,50 @@ impl<S: Storage> Database<S> {
     /// Manually issue a hardware durability sync (`fdatasync`).
     pub fn sync(&self) -> Result<()> {
         self.cache.sync()
+    }
+
+    /// Explicitly close and flush all dirty pages down to storage and issue a hardware sync.
+    pub fn close(self) -> Result<()> {
+        self.cache.flush()
+    }
+
+    /// Structural integrity verifier (`fsck`) across all tables and B+ Tree key invariants.
+    pub fn verify(&self) -> Result<(usize, usize)> {
+        let rx = self.begin_read()?;
+        let mut tables_checked = 1usize;
+        let mut keys_checked = 0usize;
+        let mut prev_key: Option<Vec<u8>> = None;
+        rx.scan_range_visitor(&KeyRange::all(), |k, _v| {
+            if let Some(prev) = &prev_key {
+                if k <= prev.as_slice() {
+                    return Err(DbError::Corruption(
+                        "Default B-Tree key ordering violation".into(),
+                    ));
+                }
+            }
+            prev_key = Some(k.to_vec());
+            keys_checked += 1;
+            Ok(true)
+        })?;
+
+        for table_name in rx.physical_tables() {
+            let tbl = rx.open_table(&table_name)?;
+            let mut tbl_prev: Option<Vec<u8>> = None;
+            tbl.scan_range_visitor(&KeyRange::all(), |k, _v| {
+                if let Some(prev) = &tbl_prev {
+                    if k <= prev.as_slice() {
+                        return Err(DbError::Corruption(format!(
+                            "Table '{table_name}' B-Tree key ordering violation"
+                        )));
+                    }
+                }
+                tbl_prev = Some(k.to_vec());
+                keys_checked += 1;
+                Ok(true)
+            })?;
+            tables_checked += 1;
+        }
+        Ok((tables_checked, keys_checked))
     }
 
     /// Get current engine performance and storage statistics.

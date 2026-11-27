@@ -71,12 +71,17 @@ impl<S: Storage> PreparedStatement<S> {
                 thread_local! {
                     static ROW_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                 }
-                crate::constraint_eval::validate_check_constraints(schema, params)?;
+                if !schema.check_constraints.is_empty() {
+                    crate::constraint_eval::validate_check_constraints(schema, params)?;
+                }
                 let mut tbl = tx.open_table_mut(table_name)?;
-                let rowid = self
-                    .engine
-                    .auto_rowid
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let rowid = if schema.pk_indices.is_empty() {
+                    self.engine
+                        .auto_rowid
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    0
+                };
                 schema.with_row_key(params, rowid, |key_bytes| -> Result<()> {
                     ROW_BUF.with(|cell| -> Result<()> {
                         let mut val_buf = cell.borrow_mut();
@@ -86,47 +91,15 @@ impl<S: Storage> PreparedStatement<S> {
                 })?;
                 Ok(QueryResult::affected(1))
             }
-            CompiledStatement::PointUpdate {
-                table_name,
-                schema,
-                col_idx,
-                val_param_idx,
-                pk_param_idx,
-            } => {
-                let pk_val = params
-                    .get(*pk_param_idx)
-                    .ok_or_else(|| DbError::Custom("Missing primary key parameter".into()))?;
-                let new_val = params
-                    .get(*val_param_idx)
-                    .ok_or_else(|| DbError::Custom("Missing value parameter".into()))?;
-                let key_bytes = pk_val.encode_key();
-
-                let mut tbl = tx.open_table_mut(table_name)?;
-                if let Some(val_bytes) = tbl.get(&key_bytes)? {
-                    let mut row = schema.decode_row_value(&val_bytes)?;
-                    if *col_idx < row.len() {
-                        row[*col_idx] = new_val.clone();
-                        crate::constraint_eval::validate_check_constraints(schema, &row)?;
-                        let updated_bytes = schema.encode_row_value(&row)?;
-                        let is_pk_col = schema.pk_indices.contains(col_idx);
-                        if is_pk_col {
-                            let new_key = schema.encode_row_key(&row, 0);
-                            if new_key != key_bytes {
-                                if tbl.get(&new_key)?.is_some() {
-                                    return Err(DbError::Custom(
-                                        "Primary key uniqueness violation".into(),
-                                    ));
-                                }
-                                tbl.delete(&key_bytes)?;
-                                tbl.put(&new_key, &updated_bytes)?;
-                                return Ok(QueryResult::affected(1));
-                            }
-                        }
-                        tbl.put(&key_bytes, &updated_bytes)?;
-                        return Ok(QueryResult::affected(1));
-                    }
+            CompiledStatement::PointUpdate { table_name, .. } => {
+                thread_local! {
+                    static UPDATE_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                 }
-                Ok(QueryResult::affected(0))
+                let mut tbl = tx.open_table_mut(table_name)?;
+                UPDATE_BUF.with(|cell| {
+                    let mut val_buf = cell.borrow_mut();
+                    self.execute_in_table_buf(&mut tbl, params, &mut val_buf)
+                })
             }
             CompiledStatement::PointQuery {
                 table_name,
@@ -177,10 +150,20 @@ impl<S: Storage> PreparedStatement<S> {
         let found = pk_val.with_key_bytes(|key_bytes| -> Result<Option<QueryResult>> {
             tbl.with_value(key_bytes, |slice| -> Result<QueryResult> {
                 let full_row = schema.decode_row_value(slice)?;
-                let mut row = Vec::with_capacity(projected_col_indices.len());
-                for &idx in projected_col_indices {
-                    row.push(full_row.get(idx).cloned().unwrap_or(Value::Null));
-                }
+                let row = if projected_col_indices.len() == full_row.len()
+                    && projected_col_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &idx)| i == idx)
+                {
+                    full_row
+                } else {
+                    let mut r = Vec::with_capacity(projected_col_indices.len());
+                    for &idx in projected_col_indices {
+                        r.push(full_row.get(idx).cloned().unwrap_or(Value::Null));
+                    }
+                    r
+                };
                 Ok(QueryResult::rows(result_column_names.to_vec(), vec![row]))
             })
         })?;
@@ -305,11 +288,16 @@ impl<S: Storage> PreparedStatement<S> {
     ) -> Result<QueryResult> {
         match &self.compiled {
             CompiledStatement::PointInsert { schema, .. } => {
-                crate::constraint_eval::validate_check_constraints(schema, params)?;
-                let rowid = self
-                    .engine
-                    .auto_rowid
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !schema.check_constraints.is_empty() {
+                    crate::constraint_eval::validate_check_constraints(schema, params)?;
+                }
+                let rowid = if schema.pk_indices.is_empty() {
+                    self.engine
+                        .auto_rowid
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    0
+                };
                 schema.with_row_key(params, rowid, |key_bytes| -> Result<()> {
                     schema.encode_row_value_into(params, val_buf)?;
                     tbl.put(key_bytes, val_buf)
@@ -329,33 +317,66 @@ impl<S: Storage> PreparedStatement<S> {
                 let new_val = params
                     .get(*val_param_idx)
                     .ok_or_else(|| DbError::Custom("Missing value parameter".into()))?;
-                let key_bytes = pk_val.encode_key();
+                let updated = pk_val.with_key_bytes(|key_bytes| -> Result<bool> {
+                    let is_pk_col = schema.pk_indices.contains(col_idx);
+                    if !is_pk_col {
+                        let found = tbl
+                            .with_value(key_bytes, |val_bytes| -> Result<bool> {
+                                if schema.check_constraints.is_empty()
+                                    && schema.try_update_fixed_col_in_bytes(
+                                        val_bytes, *col_idx, new_val, val_buf,
+                                    )?
+                                {
+                                    return Ok(true);
+                                }
+                                let mut row = schema.decode_row_value(val_bytes)?;
+                                if *col_idx < row.len() {
+                                    row[*col_idx] = new_val.clone();
+                                    if !schema.check_constraints.is_empty() {
+                                        crate::constraint_eval::validate_check_constraints(
+                                            schema, &row,
+                                        )?;
+                                    }
+                                    schema.encode_row_value_into(&row, val_buf)?;
+                                    Ok(true)
+                                } else {
+                                    Ok(false)
+                                }
+                            })?
+                            .unwrap_or(false);
+                        if found {
+                            tbl.put(key_bytes, val_buf)?;
+                        }
+                        return Ok(found);
+                    }
 
-                if let Some(val_bytes) = tbl.get(&key_bytes)? {
+                    let Some(val_bytes) = tbl.get(key_bytes)? else {
+                        return Ok(false);
+                    };
                     let mut row = schema.decode_row_value(&val_bytes)?;
                     if *col_idx < row.len() {
                         row[*col_idx] = new_val.clone();
-                        crate::constraint_eval::validate_check_constraints(schema, &row)?;
-                        let updated_bytes = schema.encode_row_value(&row)?;
-                        let is_pk_col = schema.pk_indices.contains(col_idx);
-                        if is_pk_col {
-                            let new_key = schema.encode_row_key(&row, 0);
-                            if new_key != key_bytes {
-                                if tbl.get(&new_key)?.is_some() {
-                                    return Err(DbError::Custom(
-                                        "Primary key uniqueness violation".into(),
-                                    ));
-                                }
-                                tbl.delete(&key_bytes)?;
-                                tbl.put(&new_key, &updated_bytes)?;
-                                return Ok(QueryResult::affected(1));
-                            }
+                        if !schema.check_constraints.is_empty() {
+                            crate::constraint_eval::validate_check_constraints(schema, &row)?;
                         }
-                        tbl.put(&key_bytes, &updated_bytes)?;
-                        return Ok(QueryResult::affected(1));
+                        schema.encode_row_value_into(&row, val_buf)?;
+                        let new_key = schema.encode_row_key(&row, 0);
+                        if new_key != key_bytes {
+                            if tbl.get(&new_key)?.is_some() {
+                                return Err(DbError::Custom(
+                                    "Primary key uniqueness violation".into(),
+                                ));
+                            }
+                            tbl.delete(key_bytes)?;
+                            tbl.put(&new_key, val_buf)?;
+                            return Ok(true);
+                        }
+                        tbl.put(key_bytes, val_buf)?;
+                        return Ok(true);
                     }
-                }
-                Ok(QueryResult::affected(0))
+                    Ok(false)
+                })?;
+                Ok(QueryResult::affected(usize::from(updated)))
             }
             CompiledStatement::PointQuery {
                 schema,

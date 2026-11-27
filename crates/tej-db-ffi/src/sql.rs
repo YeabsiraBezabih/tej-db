@@ -8,8 +8,44 @@ use crate::handle::{DbInstance, TejDbHandle, c_str_to_str, check_not_null, check
 #[derive(Serialize)]
 struct SqlJsonResult<'a> {
     columns: &'a [String],
-    rows: &'a [Vec<tej_db_sql::Value>],
+    rows: Vec<Vec<serde_json::Value>>,
     rows_affected: usize,
+}
+
+fn value_to_json(v: &tej_db_sql::Value) -> serde_json::Value {
+    match v {
+        tej_db_sql::Value::Null => serde_json::Value::Null,
+        tej_db_sql::Value::Integer(i) => serde_json::json!(i),
+        tej_db_sql::Value::Real(f) => serde_json::json!(f),
+        tej_db_sql::Value::Text(s) => serde_json::json!(s),
+        tej_db_sql::Value::Boolean(b) => serde_json::json!(b),
+        tej_db_sql::Value::Blob(b) => serde_json::json!(b),
+        tej_db_sql::Value::Decimal(d) => serde_json::json!(d.to_string()),
+        tej_db_sql::Value::Uuid(u) => serde_json::json!(u.to_string()),
+        tej_db_sql::Value::Timestamp(t) => serde_json::json!(t.to_string()),
+        tej_db_sql::Value::Interval(i) => serde_json::json!(i.to_string()),
+        tej_db_sql::Value::Json(j) => {
+            serde_json::from_str(j.as_str()).unwrap_or_else(|_| serde_json::json!(j.as_str()))
+        }
+        tej_db_sql::Value::Vector(vec) => serde_json::json!(vec),
+        tej_db_sql::Value::List(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        }
+        tej_db_sql::Value::Struct(fields) => {
+            let mut map = serde_json::Map::new();
+            for (k, val) in fields {
+                map.insert(k.clone(), value_to_json(val));
+            }
+            serde_json::Value::Object(map)
+        }
+        tej_db_sql::Value::Map(entries) => {
+            let mut map = serde_json::Map::new();
+            for (k, val) in entries {
+                map.insert(k.to_string(), value_to_json(val));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
 }
 
 /// Executes an arbitrary SQL statement and returns the resulting rows or metadata as JSON.
@@ -36,9 +72,14 @@ pub unsafe extern "C" fn tej_db_sql_execute(
             DbInstance::Mem { sql, .. } => sql.execute(sql_str)?,
         };
 
+        let json_rows: Vec<Vec<serde_json::Value>> = result
+            .rows
+            .iter()
+            .map(|r| r.iter().map(value_to_json).collect())
+            .collect();
         let json_payload = SqlJsonResult {
             columns: &result.columns,
-            rows: &result.rows,
+            rows: json_rows,
             rows_affected: result.rows_affected,
         };
 

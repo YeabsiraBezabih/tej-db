@@ -55,6 +55,16 @@ fn evaluate_expr_inner(
             ))),
         },
         SqlExpr::UnaryOp { op, expr } => {
+            if matches!(op, UnaryOperator::Minus) {
+                if let SqlExpr::Value(SqlValue::Number(num_str, _)) = expr.as_ref() {
+                    let neg = format!("-{num_str}");
+                    if let Ok(i) = neg.parse::<i64>() {
+                        return Ok(Value::Integer(i));
+                    } else if let Ok(f) = neg.parse::<f64>() {
+                        return Ok(Value::Real(f));
+                    }
+                }
+            }
             let inner = evaluate_expr_inner(expr, schema, row, depth + 1)?;
             match op {
                 UnaryOperator::Not => match inner {
@@ -82,6 +92,15 @@ fn evaluate_expr_inner(
         }
         SqlExpr::BinaryOp { left, op, right } => {
             let left_val = evaluate_expr_inner(left, schema, row, depth + 1)?;
+            match op {
+                BinaryOperator::And if matches!(left_val, Value::Boolean(false)) => {
+                    return Ok(Value::Boolean(false));
+                }
+                BinaryOperator::Or if matches!(left_val, Value::Boolean(true)) => {
+                    return Ok(Value::Boolean(true));
+                }
+                _ => {}
+            }
             let right_val = evaluate_expr_inner(right, schema, row, depth + 1)?;
             evaluate_binary_op(&left_val, op, &right_val)
         }

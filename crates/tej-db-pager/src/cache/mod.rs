@@ -28,8 +28,6 @@ pub struct PageCache<S: Storage> {
     pub(crate) preallocated_pages: Mutex<Vec<PageId>>,
     pub(crate) pending_free: Mutex<Vec<PageId>>,
     pub(crate) active_readers: AtomicUsize,
-    pub(crate) hits: AtomicU64,
-    pub(crate) misses: AtomicU64,
 }
 
 impl<S: Storage> fmt::Debug for PageCache<S> {
@@ -79,6 +77,8 @@ impl<S: Storage> PageCache<S> {
                     dirty_pages: Vec::with_capacity(32),
                 }),
                 capacity: cap,
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
             }
         });
 
@@ -93,8 +93,6 @@ impl<S: Storage> PageCache<S> {
             preallocated_pages: Mutex::new(Vec::new()),
             pending_free: Mutex::new(Vec::new()),
             active_readers: AtomicUsize::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
@@ -124,14 +122,16 @@ impl<S: Storage> PageCache<S> {
         {
             let state = self.shards[s_idx].state.read();
             if let Some(entry) = state.entries.get(&id) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                entry.referenced.store(true, Ordering::Relaxed);
+                self.shards[s_idx].hits.fetch_add(1, Ordering::Relaxed);
+                if !entry.referenced.load(Ordering::Relaxed) {
+                    entry.referenced.store(true, Ordering::Relaxed);
+                }
                 return Ok(entry.page.clone());
             }
         }
 
         // Cache miss: read from underlying storage
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.shards[s_idx].misses.fetch_add(1, Ordering::Relaxed);
         let mut raw = [0u8; PAGE_SIZE];
         {
             let storage = self.storage.read();
@@ -179,14 +179,16 @@ impl<S: Storage> PageCache<S> {
         {
             let state = self.shards[s_idx].state.read();
             if let Some(entry) = state.entries.get(&id) {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                entry.referenced.store(true, Ordering::Relaxed);
+                self.shards[s_idx].hits.fetch_add(1, Ordering::Relaxed);
+                if !entry.referenced.load(Ordering::Relaxed) {
+                    entry.referenced.store(true, Ordering::Relaxed);
+                }
                 return f(&entry.page);
             }
         }
 
         // Cache miss: read directly from storage without extra heap allocations
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        self.shards[s_idx].misses.fetch_add(1, Ordering::Relaxed);
         let mut raw = [0u8; PAGE_SIZE];
         {
             let storage = self.storage.read();
@@ -235,22 +237,25 @@ impl<S: Storage> PageCache<S> {
             ..
         } = &mut *state;
         if let Some(entry) = entries.get_mut(&id) {
+            let mut staged = entry.page.clone();
+            let res = f(&mut staged)?;
+            entry.page = staged;
             if !entry.is_dirty {
                 entry.is_dirty = true;
                 dirty_pages.push(id);
                 self.dirty_shard_mask
-                    .fetch_or(1 << s_idx, Ordering::Relaxed);
+                    .fetch_or(1 << s_idx, Ordering::Release);
             }
             entry.dirty_seq = entry.dirty_seq.wrapping_add(1);
             entry.referenced.store(true, Ordering::Relaxed);
-            return f(&mut entry.page);
+            return Ok(res);
         }
 
         drop(state);
         let mut page = self.get_page(id)?;
-        let res = f(&mut page);
+        let res = f(&mut page)?;
         self.write_page(page)?;
-        res
+        Ok(res)
     }
 
     pub fn write_page(&self, page: Page) -> Result<()> {
@@ -272,7 +277,7 @@ impl<S: Storage> PageCache<S> {
                     entry.is_dirty = true;
                     dirty_pages.push(id);
                     self.dirty_shard_mask
-                        .fetch_or(1 << s_idx, Ordering::Relaxed);
+                        .fetch_or(1 << s_idx, Ordering::Release);
                 }
                 entry.dirty_seq = entry.dirty_seq.wrapping_add(1);
                 entry.referenced.store(true, Ordering::Relaxed);
@@ -294,7 +299,7 @@ impl<S: Storage> PageCache<S> {
         state.clock_ring.push(id);
         state.dirty_pages.push(id);
         self.dirty_shard_mask
-            .fetch_or(1 << s_idx, Ordering::Relaxed);
+            .fetch_or(1 << s_idx, Ordering::Release);
 
         Ok(())
     }
@@ -307,10 +312,9 @@ impl<S: Storage> PageCache<S> {
 
         let mut buckets: [Vec<Page>; CACHE_SHARDS] = Default::default();
         for page in pages {
-            if let Ok(header) = page.read_header() {
-                let idx = self.shard_index(header.page_id);
-                buckets[idx].push(page);
-            }
+            let header = page.read_header()?;
+            let idx = self.shard_index(header.page_id);
+            buckets[idx].push(page);
         }
 
         for (s_idx, bucket) in buckets.into_iter().enumerate() {
@@ -319,7 +323,7 @@ impl<S: Storage> PageCache<S> {
             }
             let mut state = self.shards[s_idx].state.write();
             self.dirty_shard_mask
-                .fetch_or(1 << s_idx, Ordering::Relaxed);
+                .fetch_or(1 << s_idx, Ordering::Release);
             for page in bucket {
                 let id = page.read_header()?.page_id;
                 self.evict_if_needed(s_idx, &mut state)?;

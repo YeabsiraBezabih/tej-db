@@ -13,6 +13,8 @@ pub(crate) struct TableMutationState<S: Storage> {
     pub(crate) pending_writes: Vec<tej_db_btree::RawBatchItem>,
     pub(crate) is_sorted: bool,
     pub(crate) tx_pages: tej_db_btree::TxPageSet,
+    pub(crate) pending_lookup: std::collections::HashMap<tej_db_btree::InlineKey, usize>,
+    pub(crate) pending_lookup_len: usize,
 }
 
 impl<S: Storage> fmt::Debug for TableMutationState<S> {
@@ -197,6 +199,8 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
                 pending_writes: Vec::with_capacity(32),
                 is_sorted: true,
                 tx_pages,
+                pending_lookup: std::collections::HashMap::new(),
+                pending_lookup_len: 0,
             };
             self.table_states.push(state);
             if !self.modified_tables.iter().any(|t| t == name) {
@@ -222,6 +226,8 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
                 pending_writes: Vec::with_capacity(32),
                 is_sorted: true,
                 tx_pages,
+                pending_lookup: std::collections::HashMap::new(),
+                pending_lookup_len: 0,
             };
             self.table_states.push(state);
             if !self.created_tables.iter().any(|t| t == name) {
@@ -273,6 +279,57 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
             self.changes.writes.push((key.to_vec(), val.to_vec()));
         }
         Ok(())
+    }
+
+    pub fn with_table_value_idx<R>(
+        &mut self,
+        idx: usize,
+        key: &[u8],
+        f: impl FnOnce(&[u8]) -> Result<R>,
+    ) -> Result<Option<R>> {
+        let state = &mut self.table_states[idx];
+        if state.pending_writes.len() > 16 {
+            if state.pending_lookup_len < state.pending_writes.len() {
+                for i in state.pending_lookup_len..state.pending_writes.len() {
+                    state
+                        .pending_lookup
+                        .insert(state.pending_writes[i].0.clone(), i);
+                }
+                state.pending_lookup_len = state.pending_writes.len();
+            }
+            if let Some(&pos) = state.pending_lookup.get(key) {
+                let (_, val_opt, is_overflow) = &state.pending_writes[pos];
+                if let Some(val) = val_opt {
+                    if *is_overflow {
+                        let total_len = u64::from_le_bytes(val[0..8].try_into().unwrap_or([0; 8]));
+                        let first_pid =
+                            PageId(u64::from_le_bytes(val[8..16].try_into().unwrap_or([0; 8])));
+                        let bytes = state.btree.read_overflow_chain(first_pid, total_len)?;
+                        return f(&bytes).map(Some);
+                    }
+                    return f(val.as_slice()).map(Some);
+                }
+                return Ok(None);
+            }
+        } else {
+            for (k, val_opt, is_overflow) in state.pending_writes.iter().rev() {
+                if k.as_slice() == key {
+                    if let Some(val) = val_opt {
+                        if *is_overflow {
+                            let total_len =
+                                u64::from_le_bytes(val[0..8].try_into().unwrap_or([0; 8]));
+                            let first_pid =
+                                PageId(u64::from_le_bytes(val[8..16].try_into().unwrap_or([0; 8])));
+                            let bytes = state.btree.read_overflow_chain(first_pid, total_len)?;
+                            return f(&bytes).map(Some);
+                        }
+                        return f(val.as_slice()).map(Some);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        state.btree.with_value(key, f)
     }
 
     pub fn get_table_key(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -418,71 +475,5 @@ impl<'tx, S: Storage> WriteTx<'tx, S> {
         tables.sort();
         tables.dedup();
         Ok(tables)
-    }
-
-    pub fn rollback(mut self) -> Result<()> {
-        self.pending_writes.clear();
-        self.modified_tables.clear();
-        for &pid in &self.tx_pages {
-            self.manager.cache.free_page(pid);
-        }
-        for state in &mut self.table_states {
-            for &pid in &state.tx_pages {
-                self.manager.cache.free_page(pid);
-            }
-        }
-        self.table_states.clear();
-        self.created_tables.clear();
-        self.dropped_tables.clear();
-        self.savepoints.clear();
-        self.committed = true;
-        Ok(())
-    }
-
-    /// Creates a named savepoint capturing current transaction state.
-    pub fn savepoint(&mut self, name: &str) {
-        let snap = crate::savepoint::SavepointSnapshot::capture(name, self);
-        self.savepoints.push(snap);
-    }
-
-    /// Rolls back all mutations performed after the named savepoint was set.
-    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
-        let pos = self
-            .savepoints
-            .iter()
-            .rposition(|s| s.name == name)
-            .ok_or_else(|| DbError::Custom(format!("Savepoint not found: {name}")))?;
-        let snap = self.savepoints[pos].clone();
-        snap.rollback_tx(self)?;
-        self.savepoints.truncate(pos + 1);
-        Ok(())
-    }
-
-    /// Releases a named savepoint and any savepoints created after it without rolling back.
-    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
-        let pos = self
-            .savepoints
-            .iter()
-            .rposition(|s| s.name == name)
-            .ok_or_else(|| DbError::Custom(format!("Savepoint not found: {name}")))?;
-        self.savepoints.truncate(pos);
-        Ok(())
-    }
-}
-
-impl<S: Storage> Drop for WriteTx<'_, S> {
-    fn drop(&mut self) {
-        if !self.committed {
-            for &pid in &self.tx_pages {
-                self.manager.cache.free_page(pid);
-            }
-            for state in &self.table_states {
-                for &pid in &state.tx_pages {
-                    self.manager.cache.free_page(pid);
-                }
-            }
-            tracing::debug!("Write transaction {} aborted/rolled back", self.tx_id);
-        }
-        self.manager.cache.release_reader();
     }
 }

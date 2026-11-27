@@ -18,6 +18,13 @@ pub enum ProjectionItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrderBySpec {
+    pub expr: SqlExpr,
+    pub asc: bool,
+    pub nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Plan {
     CreateTable {
         schema: TableSchema,
@@ -34,7 +41,10 @@ pub enum Plan {
         projection: Vec<ProjectionItem>,
         key_range: KeyRange,
         filter: Option<SqlExpr>,
+        distinct: bool,
+        order_by: Vec<OrderBySpec>,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
     Update {
         table: String,
@@ -153,6 +163,21 @@ impl Planner {
             _ => return Err(DbError::Custom("Only SELECT queries are supported".into())),
         };
 
+        if query.with.is_some() {
+            return Err(DbError::Custom(
+                "WITH (CTE) clauses are currently unsupported in SQL engine".into(),
+            ));
+        }
+        if query.fetch.is_some() {
+            return Err(DbError::Custom(
+                "FETCH clauses are currently unsupported in SQL engine".into(),
+            ));
+        }
+        if select.from.len() > 1 {
+            return Err(DbError::Custom(
+                "Multi-table FROM / implicit JOINs are currently unsupported in SQL engine".into(),
+            ));
+        }
         let from_table = select
             .from
             .first()
@@ -167,16 +192,33 @@ impl Planner {
         let schema = schema_provider(&table_name)
             .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
 
-        if query.order_by.is_some() {
-            return Err(DbError::Custom(
-                "ORDER BY is currently unsupported in SQL engine".into(),
-            ));
-        }
-        if query.offset.is_some() {
-            return Err(DbError::Custom(
-                "OFFSET is currently unsupported in SQL engine".into(),
-            ));
-        }
+        let order_by = match query.order_by {
+            None => Vec::new(),
+            Some(ob) => ob
+                .exprs
+                .into_iter()
+                .map(|o| OrderBySpec {
+                    expr: o.expr,
+                    asc: o.asc.unwrap_or(true),
+                    nulls_first: o.nulls_first,
+                })
+                .collect(),
+        };
+        let offset = match query.offset {
+            None => None,
+            Some(off) => match off.value {
+                SqlExpr::Value(SqlValue::Number(n, _)) => {
+                    Some(n.parse::<usize>().map_err(|_| {
+                        DbError::Custom(format!("OFFSET must be a non-negative integer, got: {n}"))
+                    })?)
+                }
+                other => {
+                    return Err(DbError::Custom(format!(
+                        "Unsupported OFFSET expression: {other:?}"
+                    )));
+                }
+            },
+        };
         match &select.group_by {
             GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
                 return Err(DbError::Custom(
@@ -195,11 +237,7 @@ impl Planner {
                 "HAVING is currently unsupported in SQL engine".into(),
             ));
         }
-        if select.distinct.is_some() {
-            return Err(DbError::Custom(
-                "DISTINCT is currently unsupported in SQL engine".into(),
-            ));
-        }
+        let distinct = select.distinct.is_some();
 
         let mut projection = Vec::new();
         for item in select.projection {
@@ -231,10 +269,19 @@ impl Planner {
             }
         }
 
-        let limit = query.limit.and_then(|l| match l {
-            SqlExpr::Value(SqlValue::Number(n, _)) => n.parse::<usize>().ok(),
-            _ => None,
-        });
+        let limit = match query.limit {
+            None => None,
+            Some(SqlExpr::Value(SqlValue::Number(n, _))) => {
+                Some(n.parse::<usize>().map_err(|_| {
+                    DbError::Custom(format!("LIMIT must be a non-negative integer, got: {n}"))
+                })?)
+            }
+            Some(other) => {
+                return Err(DbError::Custom(format!(
+                    "Unsupported LIMIT expression: {other:?}"
+                )));
+            }
+        };
 
         let (key_range, filter) = Self::optimize_where_clause(select.selection, &schema);
 
@@ -243,7 +290,10 @@ impl Planner {
             projection,
             key_range,
             filter,
+            distinct,
+            order_by,
             limit,
+            offset,
         })
     }
 
@@ -258,16 +308,19 @@ impl Planner {
 
         // Check if table has a single primary key column
         if schema.pk_indices.len() == 1 {
-            let pk_col_name = &schema.columns[schema.pk_indices[0]].name;
+            let pk_def = &schema.columns[schema.pk_indices[0]];
+            let pk_col_name = &pk_def.name;
 
             // 1. Point lookup: pk = <lit>
             if let Some(val) = extract_pk_equality(&expr, pk_col_name) {
-                let key_bytes = val.encode_key();
-                let range = KeyRange {
-                    start: Bound::Included(key_bytes.clone()),
-                    end: Bound::Included(key_bytes),
-                };
-                return (range, None);
+                if let Ok(coerced) = val.coerce(&pk_def.data_type) {
+                    let key_bytes = coerced.encode_key();
+                    let range = KeyRange {
+                        start: Bound::Included(key_bytes.clone()),
+                        end: Bound::Included(key_bytes),
+                    };
+                    return (range, None);
+                }
             }
 
             // 2. Range scan: pk >= <lit> AND pk <= <lit>

@@ -3,7 +3,6 @@ use crate::page::{
     MAX_INLINE_VAL_SIZE, OVERFLOW_FLAG, PAGE_SIZE, Page, PageType, SLOTS_START_OFFSET,
 };
 use crate::types::PageId;
-use alloc::vec::Vec;
 
 impl Page {
     #[must_use]
@@ -30,6 +29,9 @@ impl Page {
 
     pub fn leaf_get_key(&self, index: usize) -> Result<&[u8]> {
         let offset = self.slot_offset(index)?;
+        if offset + 4 > PAGE_SIZE {
+            return Err(DbError::Corruption("Leaf cell header exceeds page".into()));
+        }
         let k_len = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
         let start = offset + 4;
         let end = start + k_len;
@@ -41,6 +43,9 @@ impl Page {
 
     pub fn leaf_get_val(&self, index: usize) -> Result<&[u8]> {
         let offset = self.slot_offset(index)?;
+        if offset + 4 > PAGE_SIZE {
+            return Err(DbError::Corruption("Leaf cell header exceeds page".into()));
+        }
         let k_len = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
         let v_raw = u16::from_le_bytes([self.data[offset + 2], self.data[offset + 3]]);
         let v_len = (v_raw & !OVERFLOW_FLAG) as usize;
@@ -54,12 +59,18 @@ impl Page {
 
     pub fn leaf_is_overflow(&self, index: usize) -> Result<bool> {
         let offset = self.slot_offset(index)?;
+        if offset + 4 > PAGE_SIZE {
+            return Err(DbError::Corruption("Leaf cell header exceeds page".into()));
+        }
         let v_raw = u16::from_le_bytes([self.data[offset + 2], self.data[offset + 3]]);
         Ok((v_raw & OVERFLOW_FLAG) != 0)
     }
 
     pub fn leaf_get_overflow_ref(&self, index: usize) -> Result<(u64, PageId)> {
         let offset = self.slot_offset(index)?;
+        if offset + 4 > PAGE_SIZE {
+            return Err(DbError::Corruption("Leaf cell header exceeds page".into()));
+        }
         let k_len = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
         let v_start = offset + 4 + k_len;
         if v_start + 16 > PAGE_SIZE {
@@ -80,6 +91,9 @@ impl Page {
 
     pub fn leaf_get_kv_raw(&self, index: usize) -> Result<(&[u8], &[u8], u16)> {
         let offset = self.slot_offset(index)?;
+        if offset + 4 > PAGE_SIZE {
+            return Err(DbError::Corruption("Leaf cell header exceeds page".into()));
+        }
         let k_len = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
         let v_raw = u16::from_le_bytes([self.data[offset + 2], self.data[offset + 3]]);
         let v_len = (v_raw & !OVERFLOW_FLAG) as usize;
@@ -103,9 +117,17 @@ impl Page {
             return Ok(true);
         }
         let mut pos = SLOTS_START_OFFSET + start_idx * 2;
+        if SLOTS_START_OFFSET + count * 2 > PAGE_SIZE {
+            return Err(DbError::Corruption(
+                "Leaf slot directory exceeds page".into(),
+            ));
+        }
         for idx in start_idx..count {
             let offset = u16::from_le_bytes([self.data[pos], self.data[pos + 1]]) as usize;
             pos += 2;
+            if !(SLOTS_START_OFFSET..=PAGE_SIZE - 4).contains(&offset) {
+                return Err(DbError::Corruption("Corrupt leaf slot offset".into()));
+            }
             let k_len = u16::from_le_bytes([self.data[offset], self.data[offset + 1]]) as usize;
             let v_raw = u16::from_le_bytes([self.data[offset + 2], self.data[offset + 3]]);
             let v_len = (v_raw & !OVERFLOW_FLAG) as usize;
@@ -235,6 +257,38 @@ impl Page {
         ref_bytes[0..8].copy_from_slice(&total_len.to_le_bytes());
         ref_bytes[8..16].copy_from_slice(&first_page.0.to_le_bytes());
         self.leaf_create_with_raw_insert(new_page_id, key, &ref_bytes, 16 | OVERFLOW_FLAG)
+    }
+
+    /// Delete `key` in-place from this leaf page.
+    /// Returns `(true, overflow_ref)` if deleted, or `(false, None)` if not found.
+    pub fn leaf_delete_inplace(&mut self, key: &[u8]) -> Result<(bool, Option<(u64, PageId)>)> {
+        let search_res = self.leaf_search(key)?;
+        let del_idx = match search_res {
+            Ok(idx) => idx,
+            Err(_) => return Ok((false, None)),
+        };
+
+        let ov = if self.leaf_is_overflow(del_idx)? {
+            Some(self.leaf_get_overflow_ref(del_idx)?)
+        } else {
+            None
+        };
+
+        let count = self.item_count();
+        let slot_pos = SLOTS_START_OFFSET + del_idx * 2;
+        let slots_end = SLOTS_START_OFFSET + count * 2;
+        if del_idx + 1 < count {
+            self.data.copy_within(slot_pos + 2..slots_end, slot_pos);
+        }
+        let new_count = count - 1;
+        #[allow(clippy::cast_possible_truncation)]
+        self.data[18..20].copy_from_slice(&(new_count as u16).to_le_bytes());
+        if new_count == 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            self.data[20..22].copy_from_slice(&(PAGE_SIZE as u16).to_le_bytes());
+        }
+        self.update_checksum();
+        Ok((true, ov))
     }
 
     /// Insert or replace `(key, val)` in-place in this leaf page with raw `v_raw`.
@@ -396,87 +450,5 @@ impl Page {
         ref_bytes[0..8].copy_from_slice(&total_len.to_le_bytes());
         ref_bytes[8..16].copy_from_slice(&first_page.0.to_le_bytes());
         self.leaf_append_raw_inplace(key, &ref_bytes, 16 | OVERFLOW_FLAG)
-    }
-
-    /// Split leaf into two halves: `left` and `right`.
-    /// Returns `(left_page, right_page, middle_key)`.
-    /// Split leaf into two halves: `left` and `right` using standard 50/50 midpoint.
-    pub fn leaf_split_into(
-        &self,
-        left_id: PageId,
-        right_id: PageId,
-    ) -> Result<(Page, Page, Vec<u8>)> {
-        self.leaf_split_into_at(left_id, right_id, self.item_count() / 2)
-    }
-
-    /// Split leaf into two halves at arbitrary split index `mid`: `0..mid` in left, `mid..count` in right.
-    /// Used for right-edge append optimization where `mid = count - 1`, achieving ~95-100% fill factor on sequential appends.
-    pub fn leaf_split_into_at(
-        &self,
-        left_id: PageId,
-        right_id: PageId,
-        mid: usize,
-    ) -> Result<(Page, Page, Vec<u8>)> {
-        let count = self.item_count();
-        if count < 2 || mid == 0 || mid >= count {
-            return Err(DbError::Internal(
-                "Cannot split leaf with invalid split boundary".into(),
-            ));
-        }
-        let mid_key = self.leaf_get_key(mid)?.to_vec();
-
-        let mut left = Page::new_leaf(left_id, right_id);
-        let mut right = Page::new_leaf(right_id, self.aux_ptr());
-
-        // Left items: 0..mid
-        let mut left_free_end = PAGE_SIZE;
-        for i in 0..mid {
-            let (k, v, v_raw) = self.leaf_get_kv_raw(i)?;
-            let cell_size = 4 + k.len() + v.len();
-            left_free_end -= cell_size;
-            let offset = left_free_end;
-
-            #[allow(clippy::cast_possible_truncation)]
-            left.data[offset..offset + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
-            left.data[offset + 2..offset + 4].copy_from_slice(&v_raw.to_le_bytes());
-            left.data[offset + 4..offset + 4 + k.len()].copy_from_slice(k);
-            left.data[offset + 4 + k.len()..offset + 4 + k.len() + v.len()].copy_from_slice(v);
-
-            let slot_pos = SLOTS_START_OFFSET + i * 2;
-            #[allow(clippy::cast_possible_truncation)]
-            left.data[slot_pos..slot_pos + 2].copy_from_slice(&(offset as u16).to_le_bytes());
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        left.data[18..20].copy_from_slice(&(mid as u16).to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        left.data[20..22].copy_from_slice(&(left_free_end as u16).to_le_bytes());
-        left.update_checksum();
-
-        // Right items: mid..count
-        let right_count = count - mid;
-        let mut right_free_end = PAGE_SIZE;
-        for i in 0..right_count {
-            let (k, v, v_raw) = self.leaf_get_kv_raw(mid + i)?;
-            let cell_size = 4 + k.len() + v.len();
-            right_free_end -= cell_size;
-            let offset = right_free_end;
-
-            #[allow(clippy::cast_possible_truncation)]
-            right.data[offset..offset + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
-            right.data[offset + 2..offset + 4].copy_from_slice(&v_raw.to_le_bytes());
-            right.data[offset + 4..offset + 4 + k.len()].copy_from_slice(k);
-            right.data[offset + 4 + k.len()..offset + 4 + k.len() + v.len()].copy_from_slice(v);
-
-            let slot_pos = SLOTS_START_OFFSET + i * 2;
-            #[allow(clippy::cast_possible_truncation)]
-            right.data[slot_pos..slot_pos + 2].copy_from_slice(&(offset as u16).to_le_bytes());
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        right.data[18..20].copy_from_slice(&(right_count as u16).to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        right.data[20..22].copy_from_slice(&(right_free_end as u16).to_le_bytes());
-        right.update_checksum();
-
-        Ok((left, right, mid_key))
     }
 }

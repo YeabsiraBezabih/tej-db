@@ -109,14 +109,32 @@ impl PhysicalHashAggregate {
                 }
                 AggregateFunction::SumInt64 => {
                     let slice = col.as_i64_slice();
-                    let sum: i64 = slice.iter().sum();
+                    let sum: i64 = if col.null_count() == 0 {
+                        slice.iter().sum()
+                    } else {
+                        slice
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| !col.is_null(i))
+                            .map(|(_, &v)| v)
+                            .sum()
+                    };
                     if let AggState::SumInt64(s) = state {
                         *s += sum;
                     }
                 }
                 AggregateFunction::AvgFloat64 => {
                     let slice = col.as_f64_slice();
-                    let sum: f64 = slice.iter().sum();
+                    let sum: f64 = if col.null_count() == 0 {
+                        slice.iter().sum()
+                    } else {
+                        slice
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| !col.is_null(i))
+                            .map(|(_, &v)| v)
+                            .sum()
+                    };
                     let null_cnt = u64::from(col.null_count());
                     let cnt = (col.len() as u64).saturating_sub(null_cnt);
                     if let AggState::AvgFloat64 {
@@ -130,7 +148,17 @@ impl PhysicalHashAggregate {
                 }
                 AggregateFunction::MinInt64 => {
                     let slice = col.as_i64_slice();
-                    if let Some(&min_val) = slice.iter().min() {
+                    let min_opt = if col.null_count() == 0 {
+                        slice.iter().copied().min()
+                    } else {
+                        slice
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| !col.is_null(i))
+                            .map(|(_, &v)| v)
+                            .min()
+                    };
+                    if let Some(min_val) = min_opt {
                         if let AggState::MinInt64(m) = state {
                             *m = (*m).min(min_val);
                         }
@@ -138,7 +166,17 @@ impl PhysicalHashAggregate {
                 }
                 AggregateFunction::MaxInt64 => {
                     let slice = col.as_i64_slice();
-                    if let Some(&max_val) = slice.iter().max() {
+                    let max_opt = if col.null_count() == 0 {
+                        slice.iter().copied().max()
+                    } else {
+                        slice
+                            .iter()
+                            .enumerate()
+                            .filter(|&(i, _)| !col.is_null(i))
+                            .map(|(_, &v)| v)
+                            .max()
+                    };
+                    if let Some(max_val) = max_opt {
                         if let AggState::MaxInt64(m) = state {
                             *m = (*m).max(max_val);
                         }

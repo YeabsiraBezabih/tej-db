@@ -141,6 +141,7 @@ impl TableSchema {
     /// Encode row values directly into a reusable destination buffer without heap allocations.
     pub fn encode_row_value_into(&self, row: &[Value], out: &mut Vec<u8>) -> Result<()> {
         out.clear();
+        out.reserve(8 + row.len() * 16);
         #[allow(clippy::cast_possible_truncation)]
         let num = row.len() as u64;
         out.extend_from_slice(&num.to_le_bytes());
@@ -186,6 +187,93 @@ impl TableSchema {
         Ok(())
     }
 
+    /// Fast-path in-place update of a fixed-width column (`Integer`, `Real`, `Boolean`)
+    /// directly in serialized row bytes without decoding strings or allocating `Vec<Value>`.
+    /// Returns `Ok(true)` if updated in-place, `Ok(false)` if fallback to full decode/encode is needed.
+    #[inline]
+    pub fn try_update_fixed_col_in_bytes(
+        &self,
+        bytes: &[u8],
+        col_idx: usize,
+        new_val: &Value,
+        out: &mut Vec<u8>,
+    ) -> Result<bool> {
+        if bytes.len() < 8 {
+            return Ok(false);
+        }
+        let num_cols = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+        if col_idx >= num_cols || num_cols > (bytes.len() - 8) / 4 {
+            return Ok(false);
+        }
+
+        let new_tag: u32 = match new_val {
+            Value::Integer(_) => 1,
+            Value::Real(_) => 2,
+            Value::Boolean(_) => 4,
+            _ => return Ok(false),
+        };
+
+        let mut pos = 8usize;
+        for i in 0..=col_idx {
+            if pos + 4 > bytes.len() {
+                return Ok(false);
+            }
+            let tag = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap_or([0; 4]));
+            if i == col_idx {
+                if tag != new_tag {
+                    return Ok(false);
+                }
+                let val_pos = pos + 4;
+                match new_val {
+                    Value::Integer(v) => {
+                        if val_pos + 8 > bytes.len() {
+                            return Ok(false);
+                        }
+                        out.clear();
+                        out.extend_from_slice(bytes);
+                        out[val_pos..val_pos + 8].copy_from_slice(&v.to_le_bytes());
+                        return Ok(true);
+                    }
+                    Value::Real(v) => {
+                        if val_pos + 8 > bytes.len() {
+                            return Ok(false);
+                        }
+                        out.clear();
+                        out.extend_from_slice(bytes);
+                        out[val_pos..val_pos + 8].copy_from_slice(&v.to_le_bytes());
+                        return Ok(true);
+                    }
+                    Value::Boolean(b) => {
+                        if val_pos >= bytes.len() {
+                            return Ok(false);
+                        }
+                        out.clear();
+                        out.extend_from_slice(bytes);
+                        out[val_pos] = u8::from(*b);
+                        return Ok(true);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            pos += 4;
+            match tag {
+                0 => {}
+                1 | 2 => pos += 8,
+                3 | 5 => {
+                    if pos + 8 > bytes.len() {
+                        return Ok(false);
+                    }
+                    let slen = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap_or([0; 8]))
+                        as usize;
+                    pos += 8 + slen;
+                }
+                4 => pos += 1,
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
     /// Decode binary storage payload into row values with fast-path deserializer.
     pub fn decode_row_value(&self, bytes: &[u8]) -> Result<Vec<Value>> {
         if bytes.len() < 8 {
@@ -194,9 +282,13 @@ impl TableSchema {
         }
 
         let num_cols = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+        let total_len = bytes.len();
+        if num_cols > (total_len - 8) / 4 {
+            return bincode::deserialize(bytes)
+                .map_err(|e| DbError::Serialization(format!("Row deserialization failed: {e}")));
+        }
         let mut row = Vec::with_capacity(num_cols);
         let mut pos = 8;
-        let total_len = bytes.len();
 
         for _ in 0..num_cols {
             if pos + 4 > total_len {

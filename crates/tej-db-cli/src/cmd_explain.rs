@@ -28,6 +28,7 @@ pub fn execute_explain(db_path: &Path, query: &str) -> Result<String> {
             key_range,
             filter,
             limit,
+            ..
         } => {
             let _ = writeln!(out, "Statement:   SELECT (DQL)");
             let _ = writeln!(out, "Target Table: {table}");

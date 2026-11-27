@@ -191,17 +191,19 @@ impl Storage for FileStorage {
 
     fn allocate_page(&mut self) -> Result<PageId> {
         let id = PageId(self.page_count);
-        self.page_count += 1;
-        let new_len = self.page_count * PAGE_SIZE as u64;
+        let next_count = self.page_count + 1;
+        let new_len = next_count * PAGE_SIZE as u64;
         self.file.set_len(new_len).map_err(DbError::Io)?;
+        self.page_count = next_count;
         Ok(id)
     }
 
     fn allocate_pages(&mut self, count: usize) -> Result<Vec<PageId>> {
         let start = self.page_count;
-        self.page_count += count as u64;
-        let new_len = self.page_count * PAGE_SIZE as u64;
+        let next_count = self.page_count + count as u64;
+        let new_len = next_count * PAGE_SIZE as u64;
         self.file.set_len(new_len).map_err(DbError::Io)?;
+        self.page_count = next_count;
         let mut ids = Vec::with_capacity(count);
         for i in 0..count {
             ids.push(PageId(start + i as u64));
@@ -211,9 +213,10 @@ impl Storage for FileStorage {
 
     fn allocate_contiguous_extent(&mut self, count: usize) -> Result<PageId> {
         let start = self.page_count;
-        self.page_count += count as u64;
-        let new_len = self.page_count * PAGE_SIZE as u64;
+        let next_count = self.page_count + count as u64;
+        let new_len = next_count * PAGE_SIZE as u64;
         self.file.set_len(new_len).map_err(DbError::Io)?;
+        self.page_count = next_count;
         Ok(PageId(start))
     }
 }

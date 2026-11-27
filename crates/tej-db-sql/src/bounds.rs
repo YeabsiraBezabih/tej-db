@@ -30,10 +30,11 @@ pub(crate) fn extract_literal_value(expr: &SqlExpr) -> Option<Value> {
             expr: inner,
         } => match inner.as_ref() {
             SqlExpr::Value(SqlValue::Number(n, _)) => {
-                if let Ok(i) = n.parse::<i64>() {
-                    Some(Value::Integer(-i))
-                } else if let Ok(f) = n.parse::<f64>() {
-                    Some(Value::Real(-f))
+                let neg = format!("-{n}");
+                if let Ok(i) = neg.parse::<i64>() {
+                    Some(Value::Integer(i))
+                } else if let Ok(f) = neg.parse::<f64>() {
+                    Some(Value::Real(f))
                 } else {
                     None
                 }

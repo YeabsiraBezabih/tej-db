@@ -5,7 +5,7 @@ use crate::types::{DEFAULT_ALPHA_PRUNING, SearchCandidate, VectorId};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use tej_db_core::{PageId, Result, Storage};
-use tej_db_pager::PageCache;
+use tej_db_pager::{FastPageIdBuildHasher, PageCache};
 
 /// Page-Aligned Vamana (DiskANN) directed graph index search engine.
 pub struct VamanaSearcher<S: Storage> {
@@ -49,37 +49,46 @@ impl<S: Storage> VamanaSearcher<S> {
         let rot_query = self.quantizer.rotate(query);
         let q_norm_sq = query.iter().map(|x| x * x).sum::<f32>();
 
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::with_capacity_and_hasher(beam_width * 4, FastPageIdBuildHasher);
         let mut candidates = BinaryHeap::new();
         let mut top_k = BinaryHeap::new();
 
         // 1. Initialize with entry point
-        let entry_node = self.cache.with_page(entry_point, VectorNode::from_page)?;
-        let entry_dist = self.quantizer.estimate_l2_distance(
-            &rot_query,
-            q_norm_sq,
-            &entry_node.quantized_code,
-            entry_node.metadata.alpha,
-            entry_node.metadata.beta,
-            entry_node.metadata.norm,
-        );
-
-        let entry_cand = SearchCandidate {
-            page_id: entry_point,
-            vector_id: entry_node.metadata.vector_id,
-            distance: entry_dist,
-        };
+        let (entry_cand, entry_deleted) = self.cache.with_page(entry_point, |page| {
+            VectorNode::visit_meta_and_code(page, |meta, code| {
+                let dist = self.quantizer.estimate_l2_distance(
+                    &rot_query, q_norm_sq, code, meta.alpha, meta.beta, meta.norm,
+                );
+                (
+                    SearchCandidate {
+                        page_id: entry_point,
+                        vector_id: meta.vector_id,
+                        distance: dist,
+                    },
+                    meta.is_deleted,
+                )
+            })
+        })?;
 
         visited.insert(entry_point);
         candidates.push(std::cmp::Reverse(entry_cand));
-        if !entry_node.metadata.is_deleted
-            && predicate_filter.is_none_or(|f| f(entry_cand.vector_id))
-        {
+        if !entry_deleted && predicate_filter.is_none_or(|f| f(entry_cand.vector_id)) {
             top_k.push(entry_cand);
         }
 
-        // 2. Beam search greedy traversal
+        // 2. Beam search greedy traversal with reused neighbor buffer
+        let mut neighbors_buf = smallvec::SmallVec::<[PageId; crate::types::MAX_DEGREE_R]>::new();
+        let max_expansions = if predicate_filter.is_some() {
+            beam_width.saturating_mul(8).max(128)
+        } else {
+            beam_width.saturating_mul(4).max(64)
+        };
+        let mut expansions = 0usize;
         while let Some(std::cmp::Reverse(current)) = candidates.pop() {
+            if expansions >= max_expansions && top_k.len() >= k {
+                break;
+            }
+            expansions += 1;
             // Early exit if candidate is farther than the worst in top_k and top_k is full
             if top_k.len() >= beam_width {
                 if let Some(worst) = top_k.peek() {
@@ -89,43 +98,38 @@ impl<S: Storage> VamanaSearcher<S> {
                 }
             }
 
-            let node = self
-                .cache
-                .with_page(current.page_id, VectorNode::from_page)?;
+            self.cache.with_page(current.page_id, |page| {
+                VectorNode::read_neighbors_into(page, &mut neighbors_buf)
+            })?;
 
-            for &neighbor_pid in &node.neighbors {
+            for &neighbor_pid in &neighbors_buf {
                 if !visited.insert(neighbor_pid) {
                     continue;
                 }
 
-                let neighbor_node = match self.cache.with_page(neighbor_pid, VectorNode::from_page)
-                {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-
-                let dist = self.quantizer.estimate_l2_distance(
-                    &rot_query,
-                    q_norm_sq,
-                    &neighbor_node.quantized_code,
-                    neighbor_node.metadata.alpha,
-                    neighbor_node.metadata.beta,
-                    neighbor_node.metadata.norm,
-                );
-
-                let cand = SearchCandidate {
-                    page_id: neighbor_pid,
-                    vector_id: neighbor_node.metadata.vector_id,
-                    distance: dist,
+                let Ok((cand, is_deleted)) = self.cache.with_page(neighbor_pid, |page| {
+                    VectorNode::visit_meta_and_code(page, |meta, code| {
+                        let dist = self.quantizer.estimate_l2_distance(
+                            &rot_query, q_norm_sq, code, meta.alpha, meta.beta, meta.norm,
+                        );
+                        (
+                            SearchCandidate {
+                                page_id: neighbor_pid,
+                                vector_id: meta.vector_id,
+                                distance: dist,
+                            },
+                            meta.is_deleted,
+                        )
+                    })
+                }) else {
+                    continue;
                 };
 
                 // Traverse through candidates even if deleted to preserve graph reachability
                 candidates.push(std::cmp::Reverse(cand));
 
                 // Only consider live non-deleted nodes matching predicate filter for top_k results
-                if !neighbor_node.metadata.is_deleted
-                    && predicate_filter.is_none_or(|f| f(cand.vector_id))
-                {
+                if !is_deleted && predicate_filter.is_none_or(|f| f(cand.vector_id)) {
                     top_k.push(cand);
                     if top_k.len() > beam_width {
                         top_k.pop();

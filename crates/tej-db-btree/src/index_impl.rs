@@ -4,16 +4,46 @@ use tej_db_core::{DbError, Index, KV, KeyRange, Page, PageId, Result, Storage};
 impl<S: Storage> BTreeIndex<S> {
     /// Safe transaction-aware key removal honoring CoW and deferring page reclamation into `tx_pages`.
     pub fn remove_in_tx(&mut self, key: &[u8], tx_pages: &mut TxPageSet) -> Result<bool> {
-        let mut path = self.find_leaf_path(key)?;
+        let (deleted, _, _) = self.remove_in_tx_prepared(key, tx_pages)?;
+        Ok(deleted)
+    }
+
+    /// Cursor-friendly key removal returning `(deleted, leaf_path, tightest_upper_bound)` and
+    /// mutating `leaf_id` in-place when already CoW'd in `tx_pages`.
+    pub(crate) fn remove_in_tx_prepared(
+        &mut self,
+        key: &[u8],
+        tx_pages: &mut TxPageSet,
+    ) -> Result<(bool, Vec<PageId>, Option<Vec<u8>>)> {
+        let (mut path, bound) = self.find_leaf_path_with_bound(key)?;
         let leaf_id = path
             .pop()
             .ok_or_else(|| DbError::Corruption("Empty path".into()))?;
+
+        if tx_pages.contains(&leaf_id) {
+            let (deleted, ov) = self
+                .cache
+                .with_page_mut(leaf_id, |p| p.leaf_delete_inplace(key))?;
+            if let Some((total_len, old_first)) = ov {
+                let num_pages = if total_len == 0 {
+                    1
+                } else {
+                    total_len.div_ceil(tej_db_core::PAGE_SIZE as u64)
+                };
+                for p in 0..num_pages {
+                    tx_pages.retire(PageId(old_first.0 + p));
+                }
+            }
+            path.push(leaf_id);
+            return Ok((deleted, path, bound));
+        }
+
         let old_leaf = self.cache.get_page(leaf_id)?;
 
         let search_res = old_leaf.leaf_search(key)?;
-        let del_idx = match search_res {
-            Ok(idx) => idx,
-            Err(_) => return Ok(false),
+        let Ok(del_idx) = search_res else {
+            path.push(leaf_id);
+            return Ok((false, path, bound));
         };
 
         if old_leaf.leaf_is_overflow(del_idx)? {
@@ -66,9 +96,11 @@ impl<S: Storage> BTreeIndex<S> {
         self.cache.write_page(new_leaf)?;
         tx_pages.retire(leaf_id);
 
-        let new_root = self.propagate_up_in_tx(path, leaf_id, new_leaf_id, None, tx_pages)?;
+        let new_root =
+            self.propagate_up_in_tx(path.clone(), leaf_id, new_leaf_id, None, tx_pages)?;
         self.set_root_id(new_root);
-        Ok(true)
+        path.push(new_leaf_id);
+        Ok((true, path, bound))
     }
 }
 

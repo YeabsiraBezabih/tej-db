@@ -336,12 +336,12 @@ pub async fn get_stats(State(state): State<AppState>) -> impl IntoResponse {
 
 #[inline]
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max_len = a.len().max(b.len());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..max_len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= std::hint::black_box(x ^ y);
     }
     diff == 0
 }
@@ -352,26 +352,35 @@ pub async fn execute_sql(
     headers: axum::http::HeaderMap,
     Json(payload): Json<SqlRequest>,
 ) -> impl IntoResponse {
-    if let Ok(expected_key) = std::env::var("TEJ_API_KEY") {
-        if !expected_key.is_empty() {
-            let exp_bytes = expected_key.as_bytes();
-            let auth_ok = headers
-                .get("x-api-key")
+    let allow_insecure = std::env::var("TEJ_ALLOW_INSECURE_DEV").is_ok_and(|v| v == "1");
+    let expected_key = std::env::var("TEJ_API_KEY").unwrap_or_default();
+    if expected_key.is_empty() {
+        if !allow_insecure {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::err(
+                    "SQL endpoint disabled: set TEJ_API_KEY or TEJ_ALLOW_INSECURE_DEV=1",
+                )),
+            );
+        }
+    } else {
+        let exp_bytes = expected_key.as_bytes();
+        let auth_ok = headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|k| constant_time_eq(k.as_bytes(), exp_bytes))
+            || headers
+                .get("authorization")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|k| constant_time_eq(k.as_bytes(), exp_bytes))
-                || headers
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|h| {
-                        h.strip_prefix("Bearer ")
-                            .is_some_and(|tok| constant_time_eq(tok.as_bytes(), exp_bytes))
-                    });
-            if !auth_ok {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ApiResponse::err("Unauthorized: invalid or missing API key")),
-                );
-            }
+                .is_some_and(|h| {
+                    h.strip_prefix("Bearer ")
+                        .is_some_and(|tok| constant_time_eq(tok.as_bytes(), exp_bytes))
+                });
+        if !auth_ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::err("Unauthorized: invalid or missing API key")),
+            );
         }
     }
 

@@ -1,7 +1,7 @@
 use crate::engine::SqlEngine;
 use crate::expr::evaluate_expr;
 use crate::plan::Plan;
-use crate::result::{QueryResult, execute_select_from_items};
+use crate::result::{QueryResult, SelectOptions, execute_select_from_items};
 use crate::schema::TableSchema;
 use crate::value::Value;
 use std::ops::Bound;
@@ -38,7 +38,10 @@ impl<S: Storage> SqlEngine<S> {
             projection,
             key_range,
             filter,
+            distinct,
+            order_by,
             limit,
+            offset,
         } = plan
         {
             let schema = self
@@ -66,7 +69,18 @@ impl<S: Storage> SqlEngine<S> {
                 tbl.scan_range(key_range)?
             };
 
-            execute_select_from_items(&schema, projection, filter.as_ref(), *limit, items)
+            execute_select_from_items(
+                &schema,
+                projection,
+                filter.as_ref(),
+                SelectOptions {
+                    distinct: *distinct,
+                    order_by,
+                    limit: *limit,
+                    offset: *offset,
+                },
+                items,
+            )
         } else {
             Err(DbError::Custom("Expected Plan::Select".into()))
         }
@@ -134,6 +148,9 @@ impl<S: Storage> SqlEngine<S> {
                         }
                     }
 
+                    // 0. Validate NOT NULL constraints
+                    crate::constraint_eval::validate_not_null_constraints(&schema, &row_values)?;
+
                     // 1. Validate CHECK constraints
                     crate::constraint_eval::validate_check_constraints(&schema, &row_values)?;
 
@@ -170,7 +187,7 @@ impl<S: Storage> SqlEngine<S> {
                                 tx.put_table_key(table, &key_bytes, &val_bytes)?;
                                 inserted_count += 1;
                                 if let Some(ret) = returning {
-                                    returned_rows.push(Self::project_returning_row(
+                                    returned_rows.push(crate::upsert::project_returning_row(
                                         &schema,
                                         &ret.items,
                                         &row_values,
@@ -190,7 +207,7 @@ impl<S: Storage> SqlEngine<S> {
                     inserted_count += 1;
 
                     if let Some(ret) = returning {
-                        returned_rows.push(Self::project_returning_row(
+                        returned_rows.push(crate::upsert::project_returning_row(
                             &schema,
                             &ret.items,
                             &row_values,
@@ -218,7 +235,10 @@ impl<S: Storage> SqlEngine<S> {
                 projection,
                 key_range,
                 filter,
+                distinct,
+                order_by,
                 limit,
+                offset,
             } => {
                 let schema = self
                     .get_schema(table)?
@@ -243,7 +263,18 @@ impl<S: Storage> SqlEngine<S> {
                     tbl.scan_range(key_range)?
                 };
 
-                execute_select_from_items(&schema, projection, filter.as_ref(), *limit, items)
+                execute_select_from_items(
+                    &schema,
+                    projection,
+                    filter.as_ref(),
+                    SelectOptions {
+                        distinct: *distinct,
+                        order_by,
+                        limit: *limit,
+                        offset: *offset,
+                    },
+                    items,
+                )
             }
             Plan::Update {
                 table,
@@ -281,6 +312,7 @@ impl<S: Storage> SqlEngine<S> {
                                     row[idx] = new_val.coerce(&schema.columns[idx].data_type)?;
                                 }
                             }
+                            crate::constraint_eval::validate_not_null_constraints(&schema, &row)?;
                             crate::constraint_eval::validate_check_constraints(&schema, &row)?;
                             let updated_val = schema.encode_row_value(&row)?;
                             let new_key = if schema.pk_indices.is_empty() {
@@ -301,8 +333,9 @@ impl<S: Storage> SqlEngine<S> {
                             }
                             updated_count = 1;
                             if let Some(ret) = returning {
-                                returned_rows
-                                    .push(Self::project_returning_row(&schema, &ret.items, &row)?);
+                                returned_rows.push(crate::upsert::project_returning_row(
+                                    &schema, &ret.items, &row,
+                                )?);
                             }
                         }
                     }
@@ -325,6 +358,7 @@ impl<S: Storage> SqlEngine<S> {
                             }
                         }
 
+                        crate::constraint_eval::validate_not_null_constraints(&schema, &row)?;
                         crate::constraint_eval::validate_check_constraints(&schema, &row)?;
                         let updated_val = schema.encode_row_value(&row)?;
                         let new_key = if schema.pk_indices.is_empty() {
@@ -345,8 +379,9 @@ impl<S: Storage> SqlEngine<S> {
                         }
                         updated_count += 1;
                         if let Some(ret) = returning {
-                            returned_rows
-                                .push(Self::project_returning_row(&schema, &ret.items, &row)?);
+                            returned_rows.push(crate::upsert::project_returning_row(
+                                &schema, &ret.items, &row,
+                            )?);
                         }
                     }
                 }
@@ -397,8 +432,9 @@ impl<S: Storage> SqlEngine<S> {
                         if matches && tbl.delete(pk)? {
                             deleted_count = 1;
                             if let Some(ret) = returning {
-                                returned_rows
-                                    .push(Self::project_returning_row(&schema, &ret.items, &row)?);
+                                returned_rows.push(crate::upsert::project_returning_row(
+                                    &schema, &ret.items, &row,
+                                )?);
                             }
                         }
                     }
@@ -416,8 +452,9 @@ impl<S: Storage> SqlEngine<S> {
                         tbl.delete(&item.key)?;
                         deleted_count += 1;
                         if let Some(ret) = returning {
-                            returned_rows
-                                .push(Self::project_returning_row(&schema, &ret.items, &row)?);
+                            returned_rows.push(crate::upsert::project_returning_row(
+                                &schema, &ret.items, &row,
+                            )?);
                         }
                     }
                 }
@@ -450,30 +487,5 @@ impl<S: Storage> SqlEngine<S> {
                 Ok(QueryResult::affected(0))
             }
         }
-    }
-
-    fn project_returning_row(
-        schema: &TableSchema,
-        items: &[crate::plan::ProjectionItem],
-        row: &[Value],
-    ) -> Result<Vec<Value>> {
-        let mut out = Vec::with_capacity(items.len());
-        for it in items {
-            match it {
-                crate::plan::ProjectionItem::Wildcard => {
-                    out.extend_from_slice(row);
-                }
-                crate::plan::ProjectionItem::Column(name) => {
-                    let idx = schema
-                        .column_index(name)
-                        .ok_or_else(|| DbError::Custom(format!("Column not found: {name}")))?;
-                    out.push(row.get(idx).cloned().unwrap_or(Value::Null));
-                }
-                crate::plan::ProjectionItem::Expr { expr, .. } => {
-                    out.push(evaluate_expr(expr, schema, row)?);
-                }
-            }
-        }
-        Ok(out)
     }
 }

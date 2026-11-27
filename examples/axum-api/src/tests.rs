@@ -114,7 +114,10 @@ async fn test_axum_concurrent_load() {
 async fn test_axum_sql_endpoint() {
     let (app, _path) = setup_test_app();
 
-    // 1. Create table via POST /api/sql
+    // 0. Fail-closed when TEJ_API_KEY is unset
+    unsafe {
+        std::env::remove_var("TEJ_API_KEY");
+    }
     let create_payload = serde_json::json!({
         "sql": "CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT)"
     });
@@ -122,6 +125,21 @@ async fn test_axum_sql_endpoint() {
         .method("POST")
         .uri("/api/sql")
         .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&create_payload).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    unsafe {
+        std::env::set_var("TEJ_API_KEY", "test-secret-key");
+    }
+
+    // 1. Create table via POST /api/sql with valid API key
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/sql")
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-secret-key")
         .body(Body::from(serde_json::to_vec(&create_payload).unwrap()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -135,6 +153,7 @@ async fn test_axum_sql_endpoint() {
         .method("POST")
         .uri("/api/sql")
         .header("content-type", "application/json")
+        .header("x-api-key", "test-secret-key")
         .body(Body::from(serde_json::to_vec(&insert_payload).unwrap()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -148,6 +167,7 @@ async fn test_axum_sql_endpoint() {
         .method("POST")
         .uri("/api/sql")
         .header("content-type", "application/json")
+        .header("x-api-key", "test-secret-key")
         .body(Body::from(serde_json::to_vec(&select_payload).unwrap()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();

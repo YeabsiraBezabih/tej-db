@@ -6,6 +6,22 @@ use sqlparser::parser::Parser;
 use tej_db::{Result, Storage, WriteTx};
 use tej_db_core::{DbError, KeyRange};
 
+/// Validates NOT NULL and PRIMARY KEY non-null constraints on a coerced row.
+pub fn validate_not_null_constraints(schema: &TableSchema, row: &[Value]) -> Result<()> {
+    for (idx, col) in schema.columns.iter().enumerate() {
+        if !col.is_nullable || col.is_primary_key {
+            let val = row.get(idx).unwrap_or(&Value::Null);
+            if val.is_null() {
+                return Err(DbError::Custom(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    schema.name, col.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates all CHECK constraints defined on a table for a given row.
 pub fn validate_check_constraints(schema: &TableSchema, row: &[Value]) -> Result<()> {
     for check in &schema.check_constraints {

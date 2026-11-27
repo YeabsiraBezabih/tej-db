@@ -57,5 +57,9 @@ path = "src/bench_vector.rs"
 name = "bench_htap"
 path = "src/bench_htap.rs"
 
+[[bin]]
+name = "bench_comprehensive"
+path = "src/bench_comprehensive.rs"
+
 [lints]
 workspace = true

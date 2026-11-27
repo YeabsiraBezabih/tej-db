@@ -21,6 +21,11 @@ impl Page {
 
     pub fn internal_get_key(&self, index: usize) -> Result<&[u8]> {
         let offset = self.slot_offset(index)?;
+        if offset + 10 > PAGE_SIZE {
+            return Err(DbError::Corruption(
+                "Internal cell header exceeds page".into(),
+            ));
+        }
         let k_len = u16::from_le_bytes([self.data[offset + 8], self.data[offset + 9]]) as usize;
         let start = offset + 10;
         let end = start + k_len;

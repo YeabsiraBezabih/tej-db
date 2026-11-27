@@ -59,7 +59,10 @@ fn test_adaptive_router_path_selection() {
         projection: Vec::new(),
         key_range: KeyRange::all(),
         filter: None,
+        distinct: false,
+        order_by: Vec::new(),
         limit: Some(10),
+        offset: None,
     };
     assert_eq!(
         router.route_plan(&point_plan, 10, VectorPredicate::Absent),
@@ -72,7 +75,10 @@ fn test_adaptive_router_path_selection() {
         projection: Vec::new(),
         key_range: KeyRange::all(),
         filter: None,
+        distinct: false,
+        order_by: Vec::new(),
         limit: None,
+        offset: None,
     };
     assert_eq!(
         router.route_plan(&olap_plan, 100_000, VectorPredicate::Absent),

@@ -1,7 +1,7 @@
 use crate::cache::hasher::FastPageIdBuildHasher;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use tej_db_core::{Page, PageId};
 
 pub(crate) struct CacheEntry {
@@ -21,4 +21,6 @@ pub(crate) struct CacheShardState {
 pub(crate) struct CacheShard {
     pub(crate) state: RwLock<CacheShardState>,
     pub(crate) capacity: usize,
+    pub(crate) hits: AtomicU64,
+    pub(crate) misses: AtomicU64,
 }

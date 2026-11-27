@@ -36,8 +36,12 @@ pub unsafe extern "C" fn tej_db_vector_insert(
                 "Pointer vec_ptr is not aligned for f32".into(),
             ));
         }
-        if dim == 0 {
-            return Err(FfiError::InvalidArg("Vector dimension cannot be 0".into()));
+        if dim == 0
+            || dim
+                .checked_mul(std::mem::size_of::<f32>())
+                .is_none_or(|b| b > isize::MAX as usize)
+        {
+            return Err(FfiError::InvalidArg("Invalid vector dimension".into()));
         }
 
         // SAFETY: Pointer is non-null and valid for dim f32 floats.
@@ -88,8 +92,12 @@ pub unsafe extern "C" fn tej_db_vector_compact(
 ) -> i32 {
     catch_ffi(|| {
         check_not_null(db, "db")?;
-        if dim == 0 {
-            return Err(FfiError::InvalidArg("Vector dimension cannot be 0".into()));
+        if dim == 0
+            || dim
+                .checked_mul(std::mem::size_of::<f32>())
+                .is_none_or(|b| b > isize::MAX as usize)
+        {
+            return Err(FfiError::InvalidArg("Invalid vector dimension".into()));
         }
 
         let metric_enum = parse_metric(metric)?;
@@ -160,9 +168,14 @@ pub unsafe extern "C" fn tej_db_vector_search(
             ));
         }
 
-        if dim == 0 || top_k == 0 {
+        if dim == 0
+            || top_k == 0
+            || dim
+                .checked_mul(std::mem::size_of::<f32>())
+                .is_none_or(|b| b > isize::MAX as usize)
+        {
             return Err(FfiError::InvalidArg(
-                "dim and top_k must be greater than 0".into(),
+                "dim and top_k must be valid and greater than 0".into(),
             ));
         }
 
@@ -172,7 +185,7 @@ pub unsafe extern "C" fn tej_db_vector_search(
         let query = unsafe { std::slice::from_raw_parts(query_ptr, dim) };
         let handle = unsafe { &*db };
 
-        let beam_width = 16.max(top_k * 2);
+        let beam_width = 16usize.max(top_k.saturating_mul(2));
         let candidates = match &handle.0 {
             #[cfg(not(target_arch = "wasm32"))]
             DbInstance::File { db, .. } => {

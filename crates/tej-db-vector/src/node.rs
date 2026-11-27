@@ -91,6 +91,116 @@ impl VectorNode {
         Ok(())
     }
 
+    /// Zero-copy read of node metadata and quantized code slice without allocating `Vec<u8>` or `SmallVec`.
+    #[inline]
+    pub fn visit_meta_and_code<R>(
+        page: &Page,
+        f: impl FnOnce(&VectorNodeMetadata, &[u8]) -> R,
+    ) -> Result<R> {
+        let header = page.read_header()?;
+        if header.page_type != PageType::VectorNode {
+            return Err(DbError::InvalidPageType(header.page_type as u8));
+        }
+
+        let payload = page.payload();
+        if payload.len() < NODE_META_SIZE {
+            return Err(DbError::Corruption("Truncated VectorNode payload".into()));
+        }
+
+        let vector_id =
+            VectorId(u64::from_le_bytes(payload[0..8].try_into().map_err(
+                |_| DbError::Corruption("VectorId read failed".into()),
+            )?));
+        let overflow_page =
+            PageId(u64::from_le_bytes(payload[8..16].try_into().map_err(
+                |_| DbError::Corruption("OverflowPage read failed".into()),
+            )?));
+        let alpha = f32::from_le_bytes(
+            payload[16..20]
+                .try_into()
+                .map_err(|_| DbError::Corruption("Alpha read failed".into()))?,
+        );
+        let beta = f32::from_le_bytes(
+            payload[20..24]
+                .try_into()
+                .map_err(|_| DbError::Corruption("Beta read failed".into()))?,
+        );
+        let norm = f32::from_le_bytes(
+            payload[24..28]
+                .try_into()
+                .map_err(|_| DbError::Corruption("Norm read failed".into()))?,
+        );
+        let neighbor_count = u16::from_le_bytes(
+            payload[28..30]
+                .try_into()
+                .map_err(|_| DbError::Corruption("Neighbor count read failed".into()))?,
+        ) as usize;
+        let quantized_bytes = u16::from_le_bytes(
+            payload[30..32]
+                .try_into()
+                .map_err(|_| DbError::Corruption("Quantized bytes read failed".into()))?,
+        ) as usize;
+        let is_deleted = payload[32] != 0;
+
+        let clamped_neighbors = neighbor_count.min(MAX_DEGREE_R);
+        let code_offset = NODE_META_SIZE + clamped_neighbors * 8;
+        if code_offset + quantized_bytes > payload.len() {
+            return Err(DbError::Corruption(
+                "Truncated quantized code payload".into(),
+            ));
+        }
+        let meta = VectorNodeMetadata {
+            vector_id,
+            overflow_page,
+            alpha,
+            beta,
+            norm,
+            neighbor_count: clamped_neighbors as u16,
+            quantized_bytes: quantized_bytes as u16,
+            is_deleted,
+        };
+        Ok(f(
+            &meta,
+            &payload[code_offset..code_offset + quantized_bytes],
+        ))
+    }
+
+    /// Reads neighbor PageIds into a caller-reused buffer without allocating `Vec<u8>`.
+    #[inline]
+    pub fn read_neighbors_into(
+        page: &Page,
+        out: &mut SmallVec<[PageId; MAX_DEGREE_R]>,
+    ) -> Result<()> {
+        let header = page.read_header()?;
+        if header.page_type != PageType::VectorNode {
+            return Err(DbError::InvalidPageType(header.page_type as u8));
+        }
+        let payload = page.payload();
+        if payload.len() < NODE_META_SIZE {
+            return Err(DbError::Corruption("Truncated VectorNode payload".into()));
+        }
+        let neighbor_count = u16::from_le_bytes(
+            payload[28..30]
+                .try_into()
+                .map_err(|_| DbError::Corruption("Neighbor count read failed".into()))?,
+        ) as usize;
+        out.clear();
+        let mut offset = NODE_META_SIZE;
+        for _ in 0..neighbor_count.min(MAX_DEGREE_R) {
+            if offset + 8 > payload.len() {
+                break;
+            }
+            let pid = PageId(u64::from_le_bytes(
+                payload[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| DbError::Corruption("Neighbor PageId read failed".into()))?,
+            ));
+            out.push(pid);
+            offset += 8;
+        }
+        Ok(())
+    }
+
     /// Deserializes a `VectorNode` from a 4 KiB page.
     pub fn from_page(page: &Page) -> Result<Self> {
         let header = page.read_header()?;

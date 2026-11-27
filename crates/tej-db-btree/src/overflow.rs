@@ -40,7 +40,9 @@ impl<S: Storage> BTreeIndex<S> {
             data.len().div_ceil(tej_db_core::PAGE_SIZE)
         };
         let first_pid = self.cache.allocate_overflow_extent(num_pages)?;
-        tx_pages.insert(first_pid);
+        for i in 0..num_pages {
+            tx_pages.insert(PageId(first_pid.0 + i as u64));
+        }
 
         self.cache.write_storage_overflow(first_pid, data)?;
         Ok(first_pid)

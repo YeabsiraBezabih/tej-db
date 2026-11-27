@@ -3,6 +3,7 @@ use core::ops::Bound;
 use tej_db_core::{DbError, KeyRange, PageId, PageType, Result, Storage};
 
 impl<S: Storage> BTreeIndex<S> {
+    #[allow(dead_code)]
     pub(crate) fn find_leaf_path(&self, key: &[u8]) -> Result<Vec<PageId>> {
         let mut path = Vec::with_capacity(8);
         let mut curr_id = self.root_id();

@@ -1,5 +1,6 @@
 pub mod internal;
 pub mod leaf;
+pub mod leaf_split;
 pub mod overflow;
 pub mod simd_crc;
 
@@ -275,6 +276,11 @@ impl Page {
             return Err(DbError::Corruption("Slot index out of bounds".into()));
         }
         let pos = SLOTS_START_OFFSET + index * 2;
+        if pos + 2 > PAGE_SIZE {
+            return Err(DbError::Corruption(
+                "Slot directory exceeds page size".into(),
+            ));
+        }
         let offset = u16::from_le_bytes([self.data[pos], self.data[pos + 1]]) as usize;
         if !(SLOTS_START_OFFSET..PAGE_SIZE).contains(&offset) {
             return Err(DbError::Corruption("Corrupt slot offset in page".into()));

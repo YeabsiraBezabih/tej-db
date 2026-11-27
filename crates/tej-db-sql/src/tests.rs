@@ -453,12 +453,13 @@ fn test_sql_negative_pk_bounds_and_rejected_clauses() {
     assert_eq!(res_range.rows[0][0], Value::Text("neg_five".into()));
     assert_eq!(res_range.rows[1][0], Value::Text("zero".into()));
 
-    // 3. Rejected unsupported clauses
-    assert!(sql.execute("SELECT * FROM signed_pk ORDER BY id").is_err());
-    assert!(
-        sql.execute("SELECT * FROM signed_pk LIMIT 10 OFFSET 2")
-            .is_err()
-    );
+    // 3. ORDER BY, OFFSET, DISTINCT now supported; GROUP BY still rejected
+    let ob = sql
+        .execute("SELECT id FROM signed_pk ORDER BY id DESC LIMIT 1 OFFSET 1")
+        .unwrap();
+    assert_eq!(ob.rows.len(), 1);
+    assert_eq!(ob.rows[0][0], Value::Integer(0));
+    let dist = sql.execute("SELECT DISTINCT id FROM signed_pk").unwrap();
+    assert_eq!(dist.rows.len(), 4);
     assert!(sql.execute("SELECT id FROM signed_pk GROUP BY id").is_err());
-    assert!(sql.execute("SELECT DISTINCT id FROM signed_pk").is_err());
 }

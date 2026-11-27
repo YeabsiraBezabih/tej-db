@@ -73,14 +73,6 @@ impl<S: Storage> WriteTx<'_, S> {
                     )?;
                 }
             }
-            if !self.pending_writes.is_empty() {
-                validate_tx_conflict(
-                    &history,
-                    self.snapshot_tx_id,
-                    &self.modified_tables,
-                    &self.pending_writes,
-                )?;
-            }
         }
 
         // 5. Commit mutations to each table's B-Tree WITHOUT publishing roots yet
@@ -112,6 +104,7 @@ impl<S: Storage> WriteTx<'_, S> {
         let commit_guard = self.manager.commit_lock.lock();
 
         let mut new_default_root = None;
+        let mut default_keys = Vec::new();
         if !self.pending_writes.is_empty() {
             let mut pending = std::mem::take(&mut self.pending_writes);
             if !self.is_sorted {
@@ -119,6 +112,16 @@ impl<S: Storage> WriteTx<'_, S> {
                 pending.sort_by(|a, b| a.0.cmp(&b.0));
                 pending.dedup_by(|a, b| a.0 == b.0);
             }
+            if self.manager.next_tx_id.load(Ordering::Acquire) > self.snapshot_tx_id.0 + 1 {
+                let history = self.manager.commit_history.read();
+                validate_tx_conflict(
+                    &history,
+                    self.snapshot_tx_id,
+                    &self.modified_tables,
+                    &pending,
+                )?;
+            }
+            default_keys.extend(pending.iter().map(|(k, _, _)| k.clone()));
             let cur_root = PageId(self.manager.active_root.load(Ordering::Acquire));
             let mut target_btree =
                 BTreeIndex::new(Arc::clone(&self.manager.cache), Some(cur_root))?;
@@ -205,7 +208,7 @@ impl<S: Storage> WriteTx<'_, S> {
         }
 
         // Record history across table entries and global commit history
-        let mut all_keys = Vec::new();
+        let mut all_keys = default_keys;
         for state in &self.table_states {
             let mut table_keys = Vec::with_capacity(state.pending_writes.len());
             for item in &state.pending_writes {
